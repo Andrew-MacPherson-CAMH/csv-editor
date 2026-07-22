@@ -83,4 +83,38 @@ def test_editing_view_renders():
     at = fresh(user=_user())
     assert not at.exception
     body = " ".join(md.value for md in at.markdown)
-    assert "120 of 120 rows" in body.replace(",", "")
+    assert "120 rows" in body.replace(",", "")
+
+
+def test_clear_search_undo_redo_and_logout():
+    at = fresh(edits={(2, "email"): "x@y.co"}, search="portland")
+    clear = [b for b in at.button if (b.label or "") == "Clear search"][0]
+    at = clear.click().run()
+    assert not at.exception
+    assert at.session_state["search"] == ""
+
+    # simulate two recorded actions the way harvest_editor records them
+    at.session_state["undo_stack"] = [
+        {"row": 2, "col": "email", "inst": "DELETE"},          # created edit
+        {"row": 2, "col": "email", "inst": "MODIFY", "value": "x@y.co"},
+    ]
+    at.session_state["edits"] = {(2, "email"): "second@y.co"}
+    at = at.run()
+
+    undo_btn = [b for b in at.button if "Undo" in (b.label or "")][0]
+    assert not undo_btn.disabled
+    at = undo_btn.click().run()
+    assert at.session_state["edits"] == {(2, "email"): "x@y.co"}
+    at = [b for b in at.button if "Undo" in (b.label or "")][0].click().run()
+    assert at.session_state["edits"] == {}          # DELETE removed the edit
+
+    redo_btn = [b for b in at.button if "Redo" in (b.label or "")][0]
+    assert not redo_btn.disabled
+    at = redo_btn.click().run()
+    assert at.session_state["edits"] == {(2, "email"): "x@y.co"}
+    at = [b for b in at.button if "Redo" in (b.label or "")][0].click().run()
+    assert at.session_state["edits"] == {(2, "email"): "second@y.co"}
+
+    lo = [b for b in at.button if (b.label or "") == "Log out"][0]
+    at = lo.click().run()
+    assert at.session_state["user"] is None

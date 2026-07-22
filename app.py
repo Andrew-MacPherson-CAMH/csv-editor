@@ -14,15 +14,15 @@ render on editable columns.
 from __future__ import annotations
 
 import html
-import os
 import io
-from typing import Any, Optional
+from typing import Any
 
 import pandas as pd
 import streamlit as st
 
+
 from core.config import AppConfig, ColumnRule, load_config
-from core.validation import validate_cell, validate_edits
+from core.validation import validate_edits
 from providers.auth import AuthError, create_auth_provider
 from providers.storage import ROW_ID, StorageError, create_storage_provider
 
@@ -38,9 +38,6 @@ MUTED = "rgb(161,161,161)"
 SECONDARY = "rgb(82,82,82)"
 
 st.set_page_config(page_title="Data Editor", page_icon="🗂️", layout="wide")
-
-# AppTest cannot serialize selection-enabled dataframes; tests set this env var.
-_SELECT_MODE = "ignore" if os.environ.get("CSV_EDITOR_TESTMODE") else "rerun"
 
 # ------------------------------------------------------------- providers
 
@@ -71,7 +68,9 @@ def init_state() -> None:
     ss.setdefault("original_df", None)   # DataFrame indexed by ROW_ID
     ss.setdefault("edits", {})           # {(row_id, column): new_value}
     ss.setdefault("view", "editing")     # editing | review
-    ss.setdefault("grid_ver", 0)         # bump to reset grid selection state
+    ss.setdefault("grid_ver", 0)         # bump to rotate the grid widget key
+    ss.setdefault("undo_stack", [])      # instruction objects, see undo/redo below
+    ss.setdefault("redo_stack", [])
     ss.setdefault("just_published", None)
 
 
@@ -84,19 +83,13 @@ def load_data(force: bool = False) -> pd.DataFrame:
     if ss.original_df is None or force:
         ss.original_df = get_storage_provider().load()
         ss.edits = {}
+        ss.undo_stack, ss.redo_stack = [], []
         bump_grid()
     return ss.original_df
 
 
 def rules_by_column() -> dict[str, ColumnRule]:
     return {r.name: r for r in get_config().columns}
-
-
-def current_value(row_id: Any, column: str) -> str:
-    edits = st.session_state.edits
-    if (row_id, column) in edits:
-        return str(edits[(row_id, column)])
-    return str(st.session_state.original_df.at[row_id, column])
 
 
 def df_with_edits(df: pd.DataFrame) -> pd.DataFrame:
@@ -192,6 +185,25 @@ def inject_css() -> None:
         div[data-testid="stTextInput"] input {{
             border: none !important; box-shadow: none !important; outline: none !important;
         }}
+        /* Edge/IE add a native password-reveal eye on top of Streamlit's
+           own toggle — hide the native one */
+        input::-ms-reveal, input::-ms-clear {{ display: none !important; }}
+
+        /* kill the grid's hover toolbar (download / search / fullscreen) */
+        [data-testid="stElementToolbar"] {{ display: none !important; }}
+
+        /* the user-menu popover trigger looks like the avatar circle */
+        div[data-testid="stPopover"] button[data-testid="stPopoverButton"] {{
+            border-radius: 50%; width: 36px; height: 36px; min-height: 36px;
+            padding: 0; background: {GREEN}; border: none; color: #fff;
+            font-weight: 600; font-size: 12px;
+        }}
+        div[data-testid="stPopover"] button[data-testid="stPopoverButton"]:hover {{
+            background: {GREEN_HOVER}; color: #fff;
+        }}
+        div[data-testid="stPopover"] button[data-testid="stPopoverButton"] svg {{
+            display: none;   /* hide the caret so only initials show */
+        }}
         div[data-testid="stForm"] {{
             border: 2px solid {GREEN}; border-radius: 8px; background: #fff;
         }}
@@ -250,9 +262,7 @@ def render_login() -> None:
 def render_toolbar(subtitle: str) -> None:
     cfg = get_config()
     user = st.session_state.user
-    c_title, c_search, c_review, c_avatar, c_out = st.columns(
-        [3.0, 2.6, 1.7, 0.4, 0.5]
-    )
+    c_title, c_search, c_review, c_avatar = st.columns([3.0, 2.6, 1.7, 0.55])
     with c_title:
         st.markdown(
             f'<div style="padding-top:6px;"><span class="de-title">{esc(cfg.title)}</span>'
@@ -276,26 +286,26 @@ def render_toolbar(subtitle: str) -> None:
             bump_grid()
             st.rerun()
     with c_avatar:
-        st.markdown(
-            f'<div class="de-avatar" title="{esc(user.display_name)}">{esc(user.initials)}</div>',
-            unsafe_allow_html=True,
-        )
-    with c_out:
-        if st.button("⎋", help=f"Log out {user.display_name}"):
-            st.session_state.user = None
-            st.session_state.original_df = None
-            st.session_state.edits = {}
-            st.session_state.view = "editing"
-            st.rerun()
+        with st.popover(user.initials, help=user.display_name):
+            st.markdown(f"**{esc(user.display_name)}**", unsafe_allow_html=True)
+            if st.button("Log out", width="stretch"):
+                st.session_state.user = None
+                st.session_state.original_df = None
+                st.session_state.edits = {}
+                st.session_state.undo_stack, st.session_state.redo_stack = [], []
+                st.session_state.view = "editing"
+                st.rerun()
 
 
 # ------------------------------------------------------- grid helpers
 
 
 def grid_column_config(rules: list[ColumnRule]) -> dict:
-    cfg: dict = {ROW_ID: st.column_config.Column("#", width="small")}
+    cfg: dict = {
+        ROW_ID: st.column_config.TextColumn("#", disabled=True, width="small")
+    }
     for r in rules:
-        cfg[r.name] = st.column_config.Column(r.label)
+        cfg[r.name] = st.column_config.TextColumn(r.label, disabled=not r.editable)
     return cfg
 
 
@@ -307,113 +317,120 @@ def build_grid(page_df: pd.DataFrame, base_df: pd.DataFrame) -> pd.DataFrame:
     return grid
 
 
-def style_grid(
-    grid: pd.DataFrame,
-    errors: dict,
-    term: str = "",
-):
-    """Pandas Styler implementing the wireframe cell states.
+# ----------------------------------------------------- undo / redo core
+#
+# Every user action on a cell pushes an *instruction object* describing
+# how to restore the cell's previous pending state, e.g.
+#     {"row": 7, "col": "seats", "inst": "MODIFY", "value": "25"}
+#     {"row": 2, "col": "email", "inst": "DELETE"}
+# DELETE = remove the pending edit (cell back to its original value);
+# MODIFY = set the pending edit to `value`. Undo pops an instruction and
+# applies it verbatim; before applying, the inverse (the cell's current
+# state) is pushed to the redo stack — and vice versa.
 
-    Precedence: invalid (1d) > edited (1b) > search match (2a).
-    """
+
+def _cell_instruction(row_id, column) -> dict:
+    """Instruction that restores this cell's CURRENT pending state."""
     edits = st.session_state.edits
-    t = term.lower()
+    if (row_id, column) in edits:
+        return {"row": row_id, "col": column, "inst": "MODIFY",
+                "value": edits[(row_id, column)]}
+    return {"row": row_id, "col": column, "inst": "DELETE"}
 
-    def per_row(row):
-        styles = []
-        for col in grid.columns:
-            if col == ROW_ID:
-                styles.append(f"color:{MUTED};")
+
+def _apply_instruction(instr: dict) -> None:
+    ss = st.session_state
+    key = (instr["row"], instr["col"])
+    if instr["inst"] == "DELETE":
+        ss.edits.pop(key, None)
+    else:
+        value = str(instr["value"])
+        if value == str(ss.original_df.at[key[0], key[1]]):
+            ss.edits.pop(key, None)      # original value == no pending edit
+        else:
+            ss.edits[key] = value
+
+
+def record_action(row_id, column) -> None:
+    """Call BEFORE mutating a cell: snapshots its state for undo and
+    invalidates the redo stack (a new action forks history)."""
+    ss = st.session_state
+    ss.undo_stack.append(_cell_instruction(row_id, column))
+    ss.redo_stack.clear()
+
+
+def undo() -> None:
+    ss = st.session_state
+    if not ss.undo_stack:
+        return
+    instr = ss.undo_stack.pop()
+    ss.redo_stack.append(_cell_instruction(instr["row"], instr["col"]))
+    _apply_instruction(instr)
+    bump_grid()
+
+
+def redo() -> None:
+    ss = st.session_state
+    if not ss.redo_stack:
+        return
+    instr = ss.redo_stack.pop()
+    ss.undo_stack.append(_cell_instruction(instr["row"], instr["col"]))
+    _apply_instruction(instr)
+    bump_grid()
+
+
+def harvest_editor(widget_key: str, row_ids: list) -> None:
+    """Merge a data_editor's changes into the global edits map.
+
+    Runs on every committed cell (Enter / click away). Each real change
+    is recorded on the undo stack first. Typing the original value back
+    clears the cell's edited state, per spec.
+    """
+    ss = st.session_state
+    state = ss.get(widget_key, {})
+    original = ss.original_df
+    for pos, changes in state.get("edited_rows", {}).items():
+        row_id = row_ids[int(pos)]
+        for column, value in changes.items():
+            if column not in original.columns:
                 continue
-            key = (row.name, col)
-            if key in errors:
-                styles.append(
-                    f"background-color:{ERROR_FILL};"
-                    f"box-shadow: inset 0 0 0 2px {ERROR_RED}; font-weight:600;"
-                )
-            elif key in edits:
-                styles.append(f"background-color:{EDIT_TINT};")
-            elif t and t in str(row[col]).lower():
-                styles.append(f"background-color:{MATCH_YELLOW};")
+            new = "" if value is None else str(value)
+            current = ss.edits.get((row_id, column), str(original.at[row_id, column]))
+            if new == str(current):
+                continue                      # no actual change
+            record_action(row_id, column)
+            if new == str(original.at[row_id, column]):
+                ss.edits.pop((row_id, column), None)   # revert -> clear
             else:
-                styles.append("")
-        return styles
-
-    return grid.style.apply(per_row, axis=1)
+                ss.edits[(row_id, column)] = new
+    bump_grid()
 
 
-def selected_cell(event, page_df: pd.DataFrame) -> Optional[tuple[Any, str]]:
-    """Map a grid selection event to (row_id, column_name), if any."""
-    try:
-        cells = event.selection.cells
-    except (AttributeError, KeyError):
-        return None
-    if not cells:
-        return None
-    pos, column = cells[0]
-    if column == ROW_ID or column not in st.session_state.original_df.columns:
-        return None
-    return page_df.index[int(pos)], column
+def revert_edit(row_id, column) -> None:
+    """Revert one pending edit (review screen), undoably."""
+    record_action(row_id, column)
+    st.session_state.edits.pop((row_id, column), None)
+    bump_grid()
 
 
-def render_cell_editor(row_id: Any, column: str) -> None:
-    """Inline editor for the selected cell (active-cell state, 1b)."""
-    df = st.session_state.original_df
-    rules = rules_by_column()
-    rule = rules.get(column)
-    label = rule.label if rule else column.upper()
-    original = str(df.at[row_id, column])
-    value_now = current_value(row_id, column)
-    is_edited = (row_id, column) in st.session_state.edits
-
-    hint = ""
-    if rule:
-        bits = []
-        if rule.type != "string":
-            bits.append(rule.type)
-        if rule.min is not None or rule.max is not None:
-            bits.append(f"{rule.min if rule.min is not None else ''}–{rule.max if rule.max is not None else ''}")
-        if rule.max_length:
-            bits.append(f"max {rule.max_length} chars")
-        if rule.regex:
-            bits.append("format-checked")
-        if bits:
-            hint = " · ".join(str(b) for b in bits)
-
-    with st.form(f"cell_{row_id}_{column}", border=True):
-        top = f"Editing **{label}** · row {row_number(df, row_id)}"
-        if is_edited:
-            top += f' &nbsp; <span class="de-diff-old">{esc(original)}</span>'
-        st.markdown(top, unsafe_allow_html=True)
-        new_value = st.text_input(
-            "Value",
-            value=value_now,
-            label_visibility="collapsed",
-            help=hint or None,
-        )
-        c1, c2, c3 = st.columns([1.2, 1.6, 4])
-        commit = c1.form_submit_button("Commit", type="primary", width="stretch")
-        revert = c2.form_submit_button(
-            "Revert to original", width="stretch", disabled=not is_edited
-        )
-        if hint:
-            c3.markdown(f'<div class="de-note" style="padding-top:8px;">{esc(hint)}</div>',
-                        unsafe_allow_html=True)
-
-    if commit:
-        set_edit(row_id, column, new_value)
-        if rule:
-            err = validate_cell(new_value, rule)
-            if err and (row_id, column) in st.session_state.edits:
-                st.session_state.just_published = None
-                st.warning(f"Saved as a pending edit, but: ✗ {err}. "
-                           "Publishing is blocked until it's fixed.")
-        bump_grid()
-        st.rerun()
-    if revert:
-        st.session_state.edits.pop((row_id, column), None)
-        bump_grid()
-        st.rerun()
+def render_undo_redo() -> None:
+    """Undo / redo buttons, top-left of the grid."""
+    ss = st.session_state
+    c1, c2, _ = st.columns([0.55, 0.55, 8])
+    c1.button(
+        "↶ Undo",
+        width="stretch",
+        disabled=not ss.undo_stack,
+        help=f"{len(ss.undo_stack)} step{'s' if len(ss.undo_stack) != 1 else ''} to undo",
+        on_click=undo,
+    )
+    c2.button(
+        "↷ Redo",
+        width="stretch",
+        disabled=not ss.redo_stack,
+        help=f"{len(ss.redo_stack)} step{'s' if len(ss.redo_stack) != 1 else ''} to redo",
+        on_click=redo,
+    )
 
 
 def filter_rows(display_df: pd.DataFrame, term: str) -> pd.DataFrame:
@@ -448,101 +465,96 @@ def render_editing() -> None:
 
     # 2a — filter status bar (edits on hidden rows are kept; badge unchanged)
     if term:
+        def _clear_search():
+            # widget state may only be changed in a callback, which runs
+            # before the search input is instantiated on the next run
+            st.session_state.search = ""
+            bump_grid()
+
         bar = st.columns([5.5, 1])
         bar[0].markdown(
             f'<div class="de-filterbar">Showing <b>{len(filtered):,}</b> of {total:,} rows '
             f'matching "<mark>{esc(term)}</mark>"</div>',
             unsafe_allow_html=True,
         )
-        if bar[1].button("Clear search", width="stretch"):
-            st.session_state.search = ""
-            bump_grid()
-            st.rerun()
+        bar[1].button("Clear search", width="stretch", on_click=_clear_search)
 
-    # Inline cell editor renders ABOVE the grid (the grid fills the rest
-    # of the viewport, so anything below it would be off-screen).
-    editor_slot = st.container()
+    # undo / redo — top-left of the table
+    render_undo_redo()
 
-    # all rows in one grid that fills the remaining viewport height and
-    # the full container width; it scrolls internally in both directions
+    # inline-editable grid of all (filtered) rows: type directly in a
+    # cell, Enter or clicking away commits
     grid = build_grid(filtered, df)
-    event = st.dataframe(
-        style_grid(grid, errors={}, term=term),
-        key=f"grid_{st.session_state.grid_ver}",
+    row_ids = list(filtered.index)
+    widget_key = f"grid_{st.session_state.grid_ver}"
+    st.data_editor(
+        grid,
+        key=widget_key,
         column_config=grid_column_config(cfg.columns),
+        num_rows="fixed",
         hide_index=True,
         width="stretch",
-        height="stretch",
-        on_select=_SELECT_MODE,
-        selection_mode="single-cell",
+        height=560,   # initial paint only — the autosizer below corrects it
+        on_change=harvest_editor,
+        args=(widget_key, row_ids),
     )
 
-    sel = selected_cell(event, filtered)
-    if sel:
-        with editor_slot:
-            render_cell_editor(*sel)
+    # Autosizer: measured in the browser, not guessed in CSS. Sets the
+    # grid height to (viewport bottom − grid top − footer height), and
+    # refits on window resize and on Streamlit re-renders (the grid key
+    # rotates every commit, remounting the element). components.html JS
+    # runs in a same-origin iframe, so it can reach the parent document.
+    st.iframe(
+        """<script>
+        const P = window.parent, doc = P.document;
+        function fit() {
+          const grid = doc.querySelector('div[data-testid="stDataFrame"]');
+          if (!grid) return;
+          const top = grid.getBoundingClientRect().top;
+          const h = Math.max(P.innerHeight - top - 16, 220);
+          // Set a CSS variable only; the stylesheet applies it with
+          // !important, which React's plain inline styles can't override.
+          doc.documentElement.style.setProperty('--de-grid-h', h + 'px');
+        }
+        function fitTwice() { fit(); P.requestAnimationFrame(fit); }
+        fitTwice();
+        P.addEventListener('resize', fitTwice);
+        if (P.__deFitObserver) P.__deFitObserver.disconnect();
+        P.__deFitObserver = new P.MutationObserver(() => {
+          P.clearTimeout(P.__deFitTimer);
+          P.__deFitTimer = P.setTimeout(fitTwice, 80);
+        });
+        P.__deFitObserver.observe(doc.body, { childList: true, subtree: true });
+        </script>""",
+        height=1,
+    )
 
-    # Proper flex layout instead of viewport math: the page column is
-    # exactly 100vh, the grid's element container is the only flexible
-    # child (flex: 1), so the grid genuinely fills all remaining space
-    # and the footer sits in normal flow at the bottom — no overlap or
-    # floating when the window/devtools resize. Injected here so it only
-    # applies to the editing view. Requires the grid's `key`, which
-    # Streamlit exposes as a `st-key-…` class on its element container.
+    # editing view uses the full width; hide the sizer iframe's slot
     st.markdown(
         """<style>
-        div.block-container {
-            height: 100vh;
-            max-width: 100%;
-            display: flex; flex-direction: column;
-            overflow: hidden;
-            padding-bottom: 0.75rem;
+        div.block-container { max-width: 100%; padding-bottom: 0.5rem; }
+        div[data-testid="stElementContainer"]:has(> iframe) {
+            height: 0; min-height: 0; margin: 0; padding: 0;
         }
-        /* every wrapper between the page column and the grid must be
-           allowed to flex and to shrink below its content size */
-        div.block-container > div,
-        div.block-container div[data-testid="stVerticalBlock"] {
-            flex: 1 1 auto; min-height: 0;
-            display: flex; flex-direction: column;
-        }
-        /* non-grid siblings (toolbar, filter bar, editor, footer) keep
-           their natural height */
-        div[data-testid="stVerticalBlock"] > div[data-testid="stElementContainer"],
-        div[data-testid="stVerticalBlock"] > div[data-testid="stHorizontalBlock"],
-        div[data-testid="stVerticalBlock"] > div[data-testid="stForm"],
-        div[data-testid="stVerticalBlock"] > div[data-testid="stVerticalBlockBorderWrapper"] {
-            flex: 0 0 auto;
-        }
-        /* the grid is the one flexible child */
-        div[data-testid="stVerticalBlock"] > div[class*="st-key-grid_"] {
-            flex: 1 1 auto !important; min-height: 180px;
-            display: flex; flex-direction: column;
-        }
-        div[class*="st-key-grid_"] div[data-testid="stDataFrame"] {
-            height: 100% !important;
+        div[data-testid="stElementContainer"] > iframe { height: 0; border: 0; display: block; }
+
+        /* Grid height from the autosizer's CSS variable. Stylesheet
+           !important beats the React component's plain inline styles,
+           so re-renders can't snap the container back to its initial
+           height. Scoped by the grid widget's st-key class; applied to
+           every wrapper down to the resizable so the outer container
+           truly grows/shrinks and the footer reflows beneath it. */
+        div[class*="st-key-grid_"],
+        div[class*="st-key-grid_"] [data-testid="stFullScreenFrame"],
+        div[class*="st-key-grid_"] [data-testid="stDataFrame"],
+        div[class*="st-key-grid_"] [data-testid="stDataFrameResizable"] {
+            height: var(--de-grid-h, 560px) !important;
+            max-height: none !important;
+            min-height: 0 !important;
         }
         </style>""",
         unsafe_allow_html=True,
     )
-
-    # footer / status bar
-    n_edits = len(st.session_state.edits)
-    f1, f2 = st.columns([4.4, 1.8])
-    with f1:
-        st.markdown(
-            f'<div class="de-legend">'
-            f'<span class="de-swatch" style="background:{EDIT_TINT};"></span>edited cell'
-            + (f' &nbsp; <span class="de-swatch" style="background:{MATCH_YELLOW};"></span>search match' if term else "")
-            + f' &nbsp;·&nbsp; {n_edits} pending edit{"s" if n_edits != 1 else ""}'
-            f' &nbsp;·&nbsp; click a cell to edit</div>',
-            unsafe_allow_html=True,
-        )
-    with f2:
-        st.markdown(
-            f'<div class="de-legend" style="text-align:right;padding-top:2px;">'
-            f'{len(filtered):,} of {total:,} rows{" (filtered)" if term else ""}</div>',
-            unsafe_allow_html=True,
-        )
 
 
 # ------------------------------------------------------ review (1c/1d/1e)
@@ -595,38 +607,55 @@ def render_review() -> None:
                     unsafe_allow_html=True)
         return
 
-    # grid of ONLY edited rows; changed cells show `old → new` (+ error)
+    # inline-editable grid of ONLY the edited rows (new values shown;
+    # type to adjust further — reverting to the original clears the edit
+    # and drops the cell, or use ↩ in the change list below)
     page_df = df_with_edits(df.loc[edited_row_ids])
     grid = build_grid(page_df, df)
-    for (row_id, column), new in edits.items():
-        old = str(df.at[row_id, column])
-        text = f"{old} → {new}"
-        err = errors.get((row_id, column))
-        if err:
-            text += f"   ✗ {err}"
-        grid.at[row_id, column] = text
-
-    event = st.dataframe(
-        style_grid(grid, errors=errors),
-        key=f"review_grid_{st.session_state.grid_ver}",
+    widget_key = f"review_grid_{st.session_state.grid_ver}"
+    st.data_editor(
+        grid,
+        key=widget_key,
         column_config=grid_column_config(cfg.columns),
+        num_rows="fixed",
         hide_index=True,
         width="stretch",
         height="content",
-        on_select=_SELECT_MODE,
-        selection_mode="single-cell",
-    )
-    st.markdown(
-        f'<div class="de-legend" style="margin-top:-6px;">'
-        f'<span class="de-swatch" style="background:{EDIT_TINT};"></span>changed (old → new) &nbsp; '
-        f'<span class="de-swatch" style="background:{ERROR_FILL};border-color:{ERROR_RED};"></span>invalid '
-        f'&nbsp;·&nbsp; cells are still editable — click one</div>',
-        unsafe_allow_html=True,
+        on_change=harvest_editor,
+        args=(widget_key, edited_row_ids),
     )
 
-    sel = selected_cell(event, page_df)
-    if sel:
-        render_cell_editor(*sel)
+    # change list: old → new with inline validation and per-change revert
+    st.markdown(
+        '<div class="de-note" style="margin-top:4px;">Pending changes (old → new)</div>',
+        unsafe_allow_html=True,
+    )
+    for (row_id, column), new in sorted(
+        edits.items(), key=lambda kv: (row_number(df, kv[0][0]), kv[0][1])
+    ):
+        rule = rules.get(column)
+        label = rule.label if rule else column.upper()
+        old = str(df.at[row_id, column])
+        err = errors.get((row_id, column))
+        err_html = f'<div class="de-diff-err">✗ {esc(err)}</div>' if err else ""
+        c1, c2 = st.columns([8, 0.6])
+        c1.markdown(
+            f'<div style="font-size:13px;padding-top:4px;'
+            + (f'background:{ERROR_FILL};border-left:3px solid {ERROR_RED};padding-left:8px;' if err else "")
+            + f'">'
+            f'<span style="color:{MUTED};">row {row_number(df, row_id)}</span> · '
+            f'<b>{esc(label)}</b>: '
+            f'<span class="de-diff-old">{esc(old)}</span> → '
+            f'<span class="de-diff-new">{esc(new)}</span>{err_html}</div>',
+            unsafe_allow_html=True,
+        )
+        c2.button(
+            "↩",
+            key=f"rev_review_{row_id}_{column}",
+            help=f'Revert to "{old}"',
+            on_click=revert_edit,
+            args=(row_id, column),
+        )
 
 
 @st.dialog("Publish these changes?")
@@ -660,6 +689,7 @@ def publish_dialog(n_rows: int, n_cells: int) -> None:
             return
         st.session_state.original_df = df_with_edits(st.session_state.original_df)
         st.session_state.edits = {}
+        st.session_state.undo_stack, st.session_state.redo_stack = [], []
         st.session_state.view = "editing"
         st.session_state.just_published = (
             f"Published {n_cells} cell{'s' if n_cells != 1 else ''} across "
