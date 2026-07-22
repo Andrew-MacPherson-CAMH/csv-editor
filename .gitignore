@@ -1,0 +1,33 @@
+# Streamlit specific
+.streamlit/secrets.toml
+.streamlit/config.toml
+
+# Python virtual environments
+venv/
+.venv/
+env/
+ENV/
+bin/
+lib/
+
+# Python caching and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment variables / Credentials
+.env
+.flaskenv
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# OS generated files
+.DS_Store
+Thumbs.db

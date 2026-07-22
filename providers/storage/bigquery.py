@@ -1,0 +1,119 @@
+"""BigQuery storage provider.
+
+Config (storage.bigquery):
+    project:   my-gcp-project
+    dataset:   my_dataset
+    table:     customers
+    id_column: id          # REQUIRED — stable unique key for row identity
+    location:  US
+
+Credentials come from Application Default Credentials:
+    gcloud auth application-default login
+or  GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
+
+Requires: pip install google-cloud-bigquery
+"""
+from __future__ import annotations
+
+from typing import Any
+
+import pandas as pd
+
+from providers.storage.base import ROW_ID, EditMap, StorageError, StorageProvider
+
+
+class BigQueryStorageProvider(StorageProvider):
+    name = "bigquery"
+
+    def __init__(self, settings: dict[str, Any]):
+        super().__init__(settings)
+        for key in ("project", "dataset", "table", "id_column"):
+            if not settings.get(key):
+                raise StorageError(f"storage.bigquery.{key} is required")
+        try:
+            from google.cloud import bigquery  # noqa: F401
+        except ImportError as exc:
+            raise StorageError(
+                "google-cloud-bigquery is not installed. "
+                "Run: pip install google-cloud-bigquery"
+            ) from exc
+
+    def _client(self):
+        from google.cloud import bigquery
+
+        return bigquery.Client(
+            project=self.settings["project"],
+            location=self.settings.get("location"),
+        )
+
+    @property
+    def _table_ref(self) -> str:
+        s = self.settings
+        return f"`{s['project']}.{s['dataset']}.{s['table']}`"
+
+    def load(self) -> pd.DataFrame:
+        id_column = self.settings["id_column"]
+        try:
+            df = self._client().query(
+                f"SELECT * FROM {self._table_ref} ORDER BY {id_column}"
+            ).to_dataframe()
+        except Exception as exc:  # google api errors vary by version
+            raise StorageError(f"BigQuery load failed: {exc}") from exc
+
+        if df[id_column].duplicated().any():
+            raise StorageError(f"id_column '{id_column}' has duplicate values")
+        df = df.set_index(df[id_column].rename(ROW_ID), drop=False)
+        # Editing works on strings; providers normalise on the way out.
+        return df.astype(str)
+
+    def apply_edits(self, df: pd.DataFrame, edits: EditMap) -> None:
+        """Apply all edits in a single MERGE so the publish is atomic."""
+        from google.cloud import bigquery
+
+        id_column = self.settings["id_column"]
+
+        # Reshape {(row_id, col): value} → one patch row per edited row.
+        patches: dict[Any, dict[str, Any]] = {}
+        for (row_id, column), value in edits.items():
+            patches.setdefault(row_id, {})[column] = value
+        if not patches:
+            return
+
+        edited_columns = sorted({c for p in patches.values() for c in p})
+        rows = [
+            {id_column: row_id, **{c: patch.get(c) for c in edited_columns}}
+            for row_id, patch in patches.items()
+        ]
+
+        set_clauses = ", ".join(
+            f"{c} = COALESCE(S.{c}, T.{c})" for c in edited_columns
+        )
+        sql = f"""
+        MERGE {self._table_ref} T
+        USING UNNEST(@patches) S
+        ON CAST(T.{id_column} AS STRING) = CAST(S.{id_column} AS STRING)
+        WHEN MATCHED THEN UPDATE SET {set_clauses}
+        """
+
+        struct_fields = [
+            bigquery.StructQueryParameter(
+                None,
+                *[
+                    bigquery.ScalarQueryParameter(k, "STRING", None if v is None else str(v))
+                    for k, v in row.items()
+                ],
+            )
+            for row in rows
+        ]
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ArrayQueryParameter("patches", "STRUCT", struct_fields)
+            ]
+        )
+        try:
+            self._client().query(sql, job_config=job_config).result()
+        except Exception as exc:
+            raise StorageError(f"BigQuery publish failed: {exc}") from exc
+
+    def display_name(self) -> str:
+        return f"{self.settings['dataset']}.{self.settings['table']}"
