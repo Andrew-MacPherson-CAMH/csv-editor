@@ -52,6 +52,20 @@ class StorageProvider(ABC):
         """
         raise NotImplementedError
 
+    def write_audit(
+        self, metadata: dict[str, Any], records: list[dict[str, Any]]
+    ) -> None:
+        """Optional second write, issued AFTER a successful publish.
+
+        `metadata`: {"last_updated_at": iso-timestamp, "last_updated_by": email}
+        `records`:  one dict per changed cell:
+                    {row_id, column, old_value, new_value, timestamp, user}
+
+        The CSV publish stands even if this fails — the app surfaces a
+        non-blocking warning. Default: no-op for backends without an
+        audit store.
+        """
+
     def display_name(self) -> str:
         """Human-readable source name for the toolbar (override freely)."""
         return self.name

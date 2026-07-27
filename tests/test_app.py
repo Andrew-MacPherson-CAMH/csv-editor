@@ -49,7 +49,7 @@ def test_review_validation_gates_publish():
     at = fresh(
         user=_user(),
         view="review",
-        edits={(2, "email"): "broken-email", (2, "seats"): "42", (5, "city"): "Portland"},
+        edits={(2, "website"): "broken-url", (2, "latitude"): "95", (5, "city_town"): "Toronto"},
     )
     assert not at.exception
     body = " ".join(md.value for md in at.markdown)
@@ -57,7 +57,8 @@ def test_review_validation_gates_publish():
     publish = [b for b in at.button if "Publish" in (b.label or "")][0]
     assert publish.disabled
 
-    at.session_state["edits"][(2, "email")] = "fixed@example.com"
+    at.session_state["edits"][(2, "website")] = "https://fixed.example.com"
+    at.session_state["edits"][(2, "latitude")] = "43.65"
     at = at.run()
     body = " ".join(md.value for md in at.markdown)
     assert "2 rows · 3 cells changed" in body
@@ -83,11 +84,11 @@ def test_editing_view_renders():
     at = fresh(user=_user())
     assert not at.exception
     body = " ".join(md.value for md in at.markdown)
-    assert "120 rows" in body.replace(",", "")
+    assert "resources.csv" in body and "96 rows" in body.replace(",", "")
 
 
 def test_clear_search_undo_redo_and_logout():
-    at = fresh(edits={(2, "email"): "x@y.co"}, search="portland")
+    at = fresh(edits={(2, "website"): "https://x.ca"}, search="toronto")
     clear = [b for b in at.button if (b.label or "") == "Clear search"][0]
     at = clear.click().run()
     assert not at.exception
@@ -95,26 +96,41 @@ def test_clear_search_undo_redo_and_logout():
 
     # simulate two recorded actions the way harvest_editor records them
     at.session_state["undo_stack"] = [
-        {"row": 2, "col": "email", "inst": "DELETE"},          # created edit
-        {"row": 2, "col": "email", "inst": "MODIFY", "value": "x@y.co"},
+        {"row": 2, "col": "website", "inst": "DELETE"},        # created edit
+        {"row": 2, "col": "website", "inst": "MODIFY", "value": "https://x.ca"},
     ]
-    at.session_state["edits"] = {(2, "email"): "second@y.co"}
+    at.session_state["edits"] = {(2, "website"): "https://second.ca"}
     at = at.run()
 
     undo_btn = [b for b in at.button if "Undo" in (b.label or "")][0]
     assert not undo_btn.disabled
     at = undo_btn.click().run()
-    assert at.session_state["edits"] == {(2, "email"): "x@y.co"}
+    assert at.session_state["edits"] == {(2, "website"): "https://x.ca"}
     at = [b for b in at.button if "Undo" in (b.label or "")][0].click().run()
     assert at.session_state["edits"] == {}          # DELETE removed the edit
 
     redo_btn = [b for b in at.button if "Redo" in (b.label or "")][0]
     assert not redo_btn.disabled
     at = redo_btn.click().run()
-    assert at.session_state["edits"] == {(2, "email"): "x@y.co"}
+    assert at.session_state["edits"] == {(2, "website"): "https://x.ca"}
     at = [b for b in at.button if "Redo" in (b.label or "")][0].click().run()
-    assert at.session_state["edits"] == {(2, "email"): "second@y.co"}
+    assert at.session_state["edits"] == {(2, "website"): "https://second.ca"}
 
     lo = [b for b in at.button if (b.label or "") == "Log out"][0]
     at = lo.click().run()
     assert at.session_state["user"] is None
+
+
+def test_required_blank_warns_but_does_not_block_publish():
+    # Blanking a required cell (phone_1) is flagged amber but publish stays
+    # enabled; a format error (website) is what disables it.
+    at = fresh(view="review", edits={(3, "phone_1"): ""})
+    body = " ".join(md.value for md in at.markdown)
+    assert "required cell" in body and "blank" in body
+    publish = [b for b in at.button if "Publish" in (b.label or "")][0]
+    assert not publish.disabled
+
+    at.session_state["edits"][(3, "website")] = "no-scheme.ca"
+    at = at.run()
+    publish = [b for b in at.button if "Publish" in (b.label or "")][0]
+    assert publish.disabled

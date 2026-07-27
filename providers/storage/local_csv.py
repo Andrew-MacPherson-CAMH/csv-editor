@@ -6,6 +6,7 @@ Config (storage.local_csv):
 """
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -59,6 +60,15 @@ class LocalCsvStorageProvider(StorageProvider):
             if os.path.exists(tmp):
                 os.unlink(tmp)
             raise StorageError(f"Failed to write {target}: {exc}") from exc
+
+    def write_audit(self, metadata, records) -> None:
+        """Append one JSON line per publish to `<csv>.audit.jsonl`."""
+        audit_path = self._path.with_suffix(self._path.suffix + ".audit.jsonl")
+        try:
+            with open(audit_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({**metadata, "records": records}) + "\n")
+        except OSError as exc:
+            raise StorageError(f"Audit write failed ({audit_path}): {exc}") from exc
 
     def display_name(self) -> str:
         return self._path.name

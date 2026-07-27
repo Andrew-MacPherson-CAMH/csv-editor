@@ -39,14 +39,18 @@ storage:
   provider: local_csv
 
   local_csv:
-    path: sample_data/customers.csv
+    path: sample_data/resources.csv
     id_column: null          # null → use file row order as the row id
 
   bigquery:
     project: my-gcp-project
     dataset: my_dataset
-    table: customers
+    table: resources
     id_column: id            # a stable unique key column is REQUIRED
+    # Optional: audit table for the post-publish metadata write.
+    # One row per changed cell (row id, column, old, new, timestamp, user,
+    # last_updated_at/by). Omit to skip the audit write.
+    audit_table: resources_audit
     # Auth uses Application Default Credentials:
     #   gcloud auth application-default login
     # or GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa.json
@@ -54,54 +58,123 @@ storage:
 
 # ------------------------------------------------------------
 # DATASET — display name + column definitions.
-# Columns/validation are placeholders until the real spec
-# arrives; edit this block only, no code changes needed.
-#
-# Per-column rules:
-#   label      display header (defaults to uppercase name)
-#   type       string | number | integer | date
-#   required   true/false (blank not allowed)
-#   min / max  numeric bounds (number/integer)
-#   max_length string length cap
-#   regex      full-match regular expression
-#   regex_hint message fragment shown on regex failure
-#   align      left | right
-#   editable   false → column is read-only in the grid
+# `type` drives BOTH the cell editor and validation:
+#   text | textarea | enum (options) | float (min/max)
+# required-but-blank cells are flagged (amber) but do NOT block
+# publish; format/type failures DO block publish.
 # ------------------------------------------------------------
 dataset:
-  display_name: customers.csv
+  display_name: resources.csv
   columns:
+    # Editor type per column: text | textarea | enum | float
+    # required-but-blank cells are flagged (amber) but do NOT block
+    # publish; format/type failures DO block publish.
+    - name: service_category
+      label: SERVICE_CATEGORY
+      type: enum
+      required: true
+      options:
+        - "211 and Other Resource Databases"
+        - "811 and Health Information"
+        - "Child Protection Services"
+        - "Crisis Lines: International"
+        - "Crisis Lines: Local"
+        - "Crisis Lines: National"
+        - "Crisis Lines: Provincial/Territorial"
+        - "Mobile Crisis Teams"
+        - "Poison Control"
+
     - name: name
       label: NAME
-      type: string
+      type: text
       required: true
-      max_length: 80
 
-    - name: email
-      label: EMAIL
-      type: string
+    - name: address
+      label: ADDRESS
+      type: text
+
+    - name: city_town
+      label: CITY_TOWN
+      type: text
       required: true
-      regex: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
-      regex_hint: "not a valid email (regex)"
 
-    - name: city
-      label: CITY
-      type: string
-      max_length: 60
+    - name: province_territory
+      label: PROVINCE_TERRITORY
+      type: enum
+      required: true
+      options:
+        - Alberta
+        - British Columbia
+        - Manitoba
+        - New Brunswick
+        - Newfoundland and Labrador
+        - Northwest Territories
+        - Nova Scotia
+        - Nunavut
+        - Ontario
+        - Prince Edward Island
+        - Quebec
+        - Saskatchewan
+        - Yukon
 
-    - name: plan
-      label: PLAN
-      type: string
-      regex: "^(free|starter|pro|enterprise)$"
-      regex_hint: "must be one of: free, starter, pro, enterprise"
+    - name: postal_code
+      label: POSTAL_CODE
+      type: text
+      normalize: postal_code        # auto-trim + normalise internal space
+      regex: "^[A-Za-z][0-9][A-Za-z] [0-9][A-Za-z][0-9]$"
+      regex_hint: "must match A1A 1A1"
 
-    - name: seats
-      label: SEATS
-      type: integer
-      min: 1
-      max: 999
-      align: right
+    - name: phone_1
+      label: PHONE_1
+      type: text
+      required: true                # blanks flagged, not blocked; mixed
+                                    # formats in the data, so no regex
 
-    - name: renewal
-      label: RENEWAL
-      type: date
+    - name: phone_2
+      label: PHONE_2
+      type: text
+
+    - name: phone_3
+      label: PHONE_3
+      type: text
+
+    - name: website
+      label: WEBSITE
+      type: text
+      regex: "^https?://.+"
+      regex_hint: "must start with http:// or https://"
+
+    - name: coverage_area
+      label: COVERAGE_AREA
+      type: text
+
+    # 24/7 or per-day list: "Mo 8:00-19:00,Tu 8:00-19:00,..."
+    - name: hours_call
+      label: HOURS_CALL
+      type: text
+
+    - name: hours_sms
+      label: HOURS_SMS
+      type: text
+
+    - name: hours_chat
+      label: HOURS_CHAT
+      type: text
+
+    - name: description
+      label: DESCRIPTION
+      type: textarea
+
+    - name: latitude
+      label: LATITUDE
+      type: float
+      required: true
+      min: -90
+      max: 90
+
+    - name: longitude
+      label: LONGITUDE
+      type: float
+      required: true
+      min: -180
+      max: 180

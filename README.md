@@ -2,7 +2,7 @@
 
 Streamlit implementation of the IYS "Data Editor" wireframes: authenticated users edit cells of a tabular dataset in a grid, filter rows with live search, review pending changes as old → new diffs with per-cell validation, and publish behind a confirmation dialog.
 
-Auth and storage are **pluggable providers selected in `config.yaml`** — swap Google Cloud auth or BigQuery for something else without touching application code.
+Auth and storage are **pluggable providers selected in `config.yaml`** (see **[CONFIG.md](CONFIG.md)** for the full guide to editing authentication, storage, and column/validation settings) — swap Google Cloud auth or BigQuery for something else without touching application code.
 
 ## Quick start
 
@@ -11,7 +11,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Log in with `admin` / `admin` (the dev `mock` auth provider — see `config.yaml`). The default storage provider is `local_csv` backed by `sample_data/customers.csv` (120 sample rows), so the app runs end-to-end with no cloud setup.
+Log in with `admin` / `admin` (the dev `mock` auth provider — see `config.yaml`). The default storage provider is `local_csv` backed by `sample_data/resources.csv` (96 sample crisis-line / community-resource rows, including required-blank cells to exercise the amber warnings), so the app runs end-to-end with no cloud setup.
 
 ## Screens → wireframes
 
@@ -113,23 +113,43 @@ register_storage_provider("postgres",
 
 The contract is documented in `providers/storage/base.py`: `load()` must return a DataFrame indexed by a stable unique row id; `apply_edits()` receives already-validated `{(row_id, column): value}` and should persist atomically where the backend allows. Same pattern for auth in `providers/auth/`.
 
-## Columns & validation (requirement C)
+## Columns & validation
 
-Column definitions and validation rules are **pure config** — when the real spec arrives, edit `dataset.columns` in `config.yaml` only:
+The dataset is the 17-column crisis-line / community-resource schema from the design handoff. Everything is config (`dataset.columns` in `config.yaml`); the `type` field is the single source of truth for BOTH the cell editor the grid opens and validation:
 
 ```yaml
-- name: seats
-  label: SEATS
-  type: integer      # string | number | integer | date
-  min: 1
-  max: 999
-  align: right
-- name: email
-  regex: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
-  regex_hint: "not a valid email (regex)"
+- name: service_category
+  type: enum          # dropdown editor; must be one of `options`
+  required: true
+  options: ["211 and Other Resource Databases", ...]   # 9 values
+- name: postal_code
+  type: text
+  normalize: postal_code       # trim + "k1a0b1" → "K1A 0B1"
+  regex: "^[A-Za-z][0-9][A-Za-z] [0-9][A-Za-z][0-9]$"
+  regex_hint: "must match A1A 1A1"
+- name: latitude
+  type: float          # number editor with min/max
+  required: true
+  min: -90
+  max: 90
+- name: description
+  type: textarea       # long text (grid opens a single-line editor —
+                       # Streamlit has no multi-line cell editor)
 ```
 
-Supported per column: `type`, `required`, `min`/`max`, `max_length`, `regex` (+ `regex_hint` for the wireframe-style error message), `editable: false` for read-only columns. Error strings match the wireframe tone ("✗ must be a whole number, 1–999").
+**Two validation severities**, per the spec: required-but-blank cells are flagged inline (amber ⚠ "required — currently blank") but do **not** block publish; format/type failures (enum, float range, regex) show red ✗ errors and **do** block publish. `phone_1` is required but has no format rule (the data has mixed formats). All text is whitespace-trimmed on commit. Header glyphs mark types: `*` required · `▾` dropdown · `¶` text area · `#.#` float.
+
+## Audit / metadata (second request)
+
+After a successful publish the app issues a second write via `StorageProvider.write_audit(metadata, records)`:
+- `metadata` = `{last_updated_at, last_updated_by}` (the signed-in email)
+- `records` = one entry per changed cell `{row_id, column, old_value, new_value, timestamp, user}`
+
+If the audit write fails the CSV publish still stands and the app shows a non-blocking warning. `local_csv` appends JSON lines to `<csv>.audit.jsonl`; `bigquery` inserts into `storage.bigquery.audit_table` (omit that key to skip). The publish dialog notes "saved as <email> · a second request records who changed what and when".
+
+## Keyboard shortcuts
+
+Ctrl/Cmd+Z = undo · Ctrl/Cmd+Shift+Z or Ctrl+Y = redo (suppressed while a cell editor has focus so native text-undo still works).
 
 ## Tests
 

@@ -115,5 +115,26 @@ class BigQueryStorageProvider(StorageProvider):
         except Exception as exc:
             raise StorageError(f"BigQuery publish failed: {exc}") from exc
 
+    def write_audit(self, metadata, records) -> None:
+        """Insert one row per changed cell into `audit_table` (if set).
+
+        Rows carry the change (row_id, column, old_value, new_value,
+        timestamp, user) plus last_updated_at / last_updated_by.
+        Skipped silently when audit_table isn't configured.
+        """
+        audit_table = self.settings.get("audit_table")
+        if not audit_table:
+            return
+        s = self.settings
+        ref = f"{s['project']}.{s['dataset']}.{audit_table}"
+        rows = [{**{k: (None if v is None else str(v)) for k, v in r.items()},
+                 **metadata} for r in records]
+        try:
+            bq_errors = self._client().insert_rows_json(ref, rows)
+        except Exception as exc:
+            raise StorageError(f"Audit write to {ref} failed: {exc}") from exc
+        if bq_errors:
+            raise StorageError(f"Audit write to {ref} rejected rows: {bq_errors}")
+
     def display_name(self) -> str:
         return f"{self.settings['dataset']}.{self.settings['table']}"

@@ -14,7 +14,6 @@ render on editable columns.
 from __future__ import annotations
 
 import html
-import io
 from typing import Any
 
 import pandas as pd
@@ -22,7 +21,9 @@ import streamlit as st
 
 
 from core.config import AppConfig, ColumnRule, load_config
-from core.validation import validate_edits
+from datetime import datetime, timezone
+from core.validation import (ERROR, WARNING, errors_only, normalize_value,
+                             validate_edits, warnings_only)
 from providers.auth import AuthError, create_auth_provider
 from providers.storage import ROW_ID, StorageError, create_storage_provider
 
@@ -72,6 +73,7 @@ def init_state() -> None:
     ss.setdefault("undo_stack", [])      # instruction objects, see undo/redo below
     ss.setdefault("redo_stack", [])
     ss.setdefault("just_published", None)
+    ss.setdefault("audit_warning", None)
 
 
 def bump_grid() -> None:
@@ -300,18 +302,54 @@ def render_toolbar(subtitle: str) -> None:
 # ------------------------------------------------------- grid helpers
 
 
+def column_header(rule: ColumnRule) -> str:
+    """Header label with the wireframes' type glyphs:
+    * required · ▾ dropdown · ¶ text area · #.# float."""
+    glyph = {"enum": " \u25be", "textarea": " \u00b6", "float": " #.#"}.get(rule.type, "")
+    star = " *" if rule.required else ""
+    return f"{rule.label}{star}{glyph}"
+
+
 def grid_column_config(rules: list[ColumnRule]) -> dict:
+    """Per-column editors, driven by the rule's `type` (the columnRules
+    schema is the single source of truth for editors AND validation):
+    enum → dropdown, float → number editor with min/max, everything
+    else → text. (Streamlit's grid has no multi-line cell editor, so
+    textarea columns open a single-line editor that accepts long text.)
+    """
     cfg: dict = {
-        ROW_ID: st.column_config.TextColumn("#", disabled=True, width="small")
+        ROW_ID: st.column_config.TextColumn("#", disabled=True, width="small", pinned=True)
     }
     for r in rules:
-        cfg[r.name] = st.column_config.TextColumn(r.label, disabled=not r.editable)
+        header = column_header(r)
+        if r.type == "enum":
+            cfg[r.name] = st.column_config.SelectboxColumn(
+                header, options=list(r.options), disabled=not r.editable
+            )
+        elif r.type == "float":
+            cfg[r.name] = st.column_config.NumberColumn(
+                header,
+                min_value=r.min,
+                max_value=r.max,
+                format="%g",
+                disabled=not r.editable,
+            )
+        elif r.type == "textarea":
+            cfg[r.name] = st.column_config.TextColumn(
+                header, width="large", disabled=not r.editable
+            )
+        else:
+            cfg[r.name] = st.column_config.TextColumn(header, disabled=not r.editable)
     return cfg
 
 
 def build_grid(page_df: pd.DataFrame, base_df: pd.DataFrame) -> pd.DataFrame:
-    """Grid frame: '#' (original row number) first, data columns after."""
+    """Grid frame: '#' (original row number) first, data columns after.
+    Float columns get numeric dtype so the number editor works."""
     grid = page_df.drop(columns=[ROW_ID], errors="ignore").astype(str)
+    for rule in get_config().columns:
+        if rule.type == "float" and rule.name in grid.columns:
+            grid[rule.name] = pd.to_numeric(grid[rule.name], errors="coerce")
     numbers = [str(row_number(base_df, rid)) for rid in page_df.index]
     grid.insert(0, ROW_ID, numbers)
     return grid
@@ -394,7 +432,10 @@ def harvest_editor(widget_key: str, row_ids: list) -> None:
         for column, value in changes.items():
             if column not in original.columns:
                 continue
-            new = "" if value is None else str(value)
+            rule = rules_by_column().get(column)
+            new = normalize_value(value, rule) if rule else (
+                "" if value is None else str(value).strip()
+            )
             current = ss.edits.get((row_id, column), str(original.at[row_id, column]))
             if new == str(current):
                 continue                      # no actual change
@@ -458,6 +499,9 @@ def render_editing() -> None:
     if st.session_state.just_published:
         st.success(st.session_state.just_published)
         st.session_state.just_published = None
+    if st.session_state.get("audit_warning"):
+        st.warning(st.session_state.audit_warning)
+        st.session_state.audit_warning = None
 
     display = df_with_edits(df)
     term = (st.session_state.get("search") or "").strip()
@@ -519,6 +563,23 @@ def render_editing() -> None:
         function fitTwice() { fit(); P.requestAnimationFrame(fit); }
         fitTwice();
         P.addEventListener('resize', fitTwice);
+        // Keyboard shortcuts: Ctrl/Cmd+Z = undo, Ctrl/Cmd+Shift+Z or
+        // Ctrl+Y = redo. Skipped while a cell editor / input has focus
+        // so native text-field undo still works there.
+        if (!P.__deKeys) {
+          P.__deKeys = true;
+          doc.addEventListener('keydown', (e) => {
+            if (!(e.ctrlKey || e.metaKey)) return;
+            const k = e.key.toLowerCase();
+            if (k !== 'z' && k !== 'y') return;
+            const t = e.target;
+            if (t && t.closest && t.closest('input, textarea, [contenteditable="true"]')) return;
+            const wantRedo = k === 'y' || (k === 'z' && e.shiftKey);
+            const btn = [...doc.querySelectorAll('button')].find(b =>
+              b.textContent.trim().startsWith(wantRedo ? '\u21b7' : '\u21b6'));
+            if (btn && !btn.disabled) { e.preventDefault(); btn.click(); }
+          }, true);
+        }
         if (P.__deFitObserver) P.__deFitObserver.disconnect();
         P.__deFitObserver = new P.MutationObserver(() => {
           P.clearTimeout(P.__deFitTimer);
@@ -565,7 +626,9 @@ def render_review() -> None:
     df = load_data()
     edits = st.session_state.edits
     rules = rules_by_column()
-    errors = validate_edits(edits, rules)
+    findings = validate_edits(edits, rules)
+    errors = errors_only(findings)          # block publish
+    warnings = warnings_only(findings)      # amber, non-blocking
 
     edited_row_ids = [rid for rid in df.index if any(k[0] == rid for k in edits)]
     n_rows, n_cells = len(edited_row_ids), len(edits)
@@ -586,6 +649,11 @@ def render_review() -> None:
             summary = (
                 f'{n_rows} row{"s" if n_rows != 1 else ""} · '
                 f'{n_cells} cell{"s" if n_cells != 1 else ""} changed'
+            )
+        if warnings:
+            summary += (
+                f' <span style="color:#b45309;">· {len(warnings)} required '
+                f'cell{"s" if len(warnings) != 1 else ""} blank</span>'
             )
         st.markdown(
             f'<div style="padding-top:6px;"><span class="de-title">Review changes</span>'
@@ -636,17 +704,25 @@ def render_review() -> None:
         rule = rules.get(column)
         label = rule.label if rule else column.upper()
         old = str(df.at[row_id, column])
+        old_disp = esc(old) if old.strip() else '<span style="color:#9ca3af;">(blank)</span>'
+        new_disp = esc(new) if str(new).strip() else '<span style="color:#9ca3af;">(blank)</span>'
         err = errors.get((row_id, column))
-        err_html = f'<div class="de-diff-err">✗ {esc(err)}</div>' if err else ""
+        warn = warnings.get((row_id, column))
+        note_html = ""
+        accent = ""
+        if err:
+            note_html = f'<div class="de-diff-err">✗ {esc(err)}</div>'
+            accent = f'background:{ERROR_FILL};border-left:3px solid {ERROR_RED};padding-left:8px;'
+        elif warn:
+            note_html = f'<div style="color:#b45309;font-size:11px;">⚠ {esc(warn)}</div>'
+            accent = f'background:{ERROR_FILL};border-left:3px solid #f59e0b;padding-left:8px;'
         c1, c2 = st.columns([8, 0.6])
         c1.markdown(
-            f'<div style="font-size:13px;padding-top:4px;'
-            + (f'background:{ERROR_FILL};border-left:3px solid {ERROR_RED};padding-left:8px;' if err else "")
-            + f'">'
+            f'<div style="font-size:13px;padding-top:4px;{accent}">'
             f'<span style="color:{MUTED};">row {row_number(df, row_id)}</span> · '
             f'<b>{esc(label)}</b>: '
-            f'<span class="de-diff-old">{esc(old)}</span> → '
-            f'<span class="de-diff-new">{esc(new)}</span>{err_html}</div>',
+            f'<span class="de-diff-old">{old_disp}</span> → '
+            f'<span class="de-diff-new">{new_disp}</span>{note_html}</div>',
             unsafe_allow_html=True,
         )
         c2.button(
@@ -661,32 +737,50 @@ def render_review() -> None:
 @st.dialog("Publish these changes?")
 def publish_dialog(n_rows: int, n_cells: int) -> None:
     cfg = get_config()
+    user = st.session_state.user
     st.markdown(
         f"You're about to update **{n_cells} cell{'s' if n_cells != 1 else ''}** across "
         f"**{n_rows} row{'s' if n_rows != 1 else ''}** in **{cfg.dataset_display_name}**. "
         "This can't be undone."
     )
-    backup = io.StringIO()
-    st.session_state.original_df.drop(columns=[ROW_ID], errors="ignore").to_csv(
-        backup, index=False
-    )
-    st.download_button(
-        "⬇ Download a backup copy first",
-        data=backup.getvalue(),
-        file_name=f"backup_{cfg.dataset_display_name.replace(' ', '_')}",
-        mime="text/csv",
+    st.markdown(
+        f'<div class="de-note">saved as {esc(user.username)} · a second request '
+        "records who changed what and when</div>",
+        unsafe_allow_html=True,
     )
     c1, c2 = st.columns(2)
     if c1.button("Cancel", width="stretch"):
         st.rerun()
     if c2.button("Yes, publish", type="primary", width="stretch"):
+        edits = dict(st.session_state.edits)
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        audit_records = [
+            {
+                "row_id": str(row_id),
+                "column": column,
+                "old_value": str(st.session_state.original_df.at[row_id, column]),
+                "new_value": str(value),
+                "timestamp": now,
+                "user": user.username,
+            }
+            for (row_id, column), value in edits.items()
+        ]
         try:
-            get_storage_provider().apply_edits(
-                st.session_state.original_df, dict(st.session_state.edits)
-            )
+            get_storage_provider().apply_edits(st.session_state.original_df, edits)
         except StorageError as exc:
             st.error(f"Publish failed — no changes were saved: {exc}")
             return
+        # Second request: metadata/audit. The CSV publish stands even if
+        # this fails — surface a non-blocking warning instead.
+        try:
+            get_storage_provider().write_audit(
+                {"last_updated_at": now, "last_updated_by": user.username},
+                audit_records,
+            )
+        except Exception as exc:
+            st.session_state.audit_warning = (
+                f"Changes were published, but the audit/metadata write failed: {exc}"
+            )
         st.session_state.original_df = df_with_edits(st.session_state.original_df)
         st.session_state.edits = {}
         st.session_state.undo_stack, st.session_state.redo_stack = [], []

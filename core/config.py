@@ -19,17 +19,27 @@ DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
 
 @dataclass(frozen=True)
 class ColumnRule:
-    """Validation + display spec for a single column."""
+    """Validation + display spec for a single column.
+
+    `type` drives BOTH the cell editor the grid opens and validation:
+        text     single-line input (default)
+        textarea multi-line text
+        enum     fixed dropdown of `options`
+        float    numeric, optional min/max
+    (legacy types string/number/integer/date remain supported)
+    """
 
     name: str
     label: str
-    type: str = "string"          # string | number | integer | date
+    type: str = "text"
     required: bool = False
+    options: tuple = ()           # enum choices
     min: Optional[float] = None
     max: Optional[float] = None
     max_length: Optional[int] = None
     regex: Optional[str] = None
     regex_hint: Optional[str] = None
+    normalize: Optional[str] = None   # e.g. "postal_code"
     align: str = "left"
     editable: bool = True
 
@@ -39,13 +49,15 @@ class ColumnRule:
         return cls(
             name=name,
             label=raw.get("label", name.upper()),
-            type=raw.get("type", "string"),
+            type=raw.get("type", "text"),
             required=bool(raw.get("required", False)),
+            options=tuple(raw.get("options") or ()),
             min=raw.get("min"),
             max=raw.get("max"),
             max_length=raw.get("max_length"),
             regex=raw.get("regex"),
             regex_hint=raw.get("regex_hint"),
+            normalize=raw.get("normalize"),
             align=raw.get("align", "left"),
             editable=bool(raw.get("editable", True)),
         )
