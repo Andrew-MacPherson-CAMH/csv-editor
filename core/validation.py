@@ -1,16 +1,3 @@
-"""Per-cell validation + normalization against per-column rules.
-
-Two severities, per the spec:
-  "warning"  required-but-blank — flagged inline (amber) but does NOT
-             block publish
-  "error"    format/type failure (enum, float range, regex, length) —
-             DOES block publish
-
-Rules come from config (`dataset.columns`); this module is the single
-source of truth for both severities. `normalize_value` is applied when a
-cell is committed (trim everything; postal codes get their internal
-space normalised).
-"""
 from __future__ import annotations
 
 import re
@@ -30,7 +17,6 @@ def _is_blank(value) -> bool:
 
 
 def normalize_value(value, rule: ColumnRule) -> str:
-    """Whitespace-trim every value; apply the rule's normalizer."""
     text = "" if value is None else str(value).strip()
     if rule.normalize == "postal_code" and text:
         compact = re.sub(r"\s+", "", text).upper()
@@ -42,11 +28,6 @@ def normalize_value(value, rule: ColumnRule) -> str:
 
 
 def validate_cell(value, rule: ColumnRule) -> Optional[tuple[str, str]]:
-    """Return (severity, message) or None if the value passes.
-
-    Messages match the wireframe tone, e.g. "must match A1A 1A1",
-    "must be a number, −90 to 90".
-    """
     if _is_blank(value):
         if rule.required:
             return (WARNING, "required — currently blank")
@@ -94,7 +75,6 @@ def validate_cell(value, rule: ColumnRule) -> Optional[tuple[str, str]]:
 
 
 def _fmt(n: float) -> str:
-    """−90 not -90.0: integer floats lose the decimal, minus is U+2212."""
     text = str(int(n)) if float(n).is_integer() else str(n)
     return text.replace("-", "\u2212")
 
@@ -122,7 +102,6 @@ def _parse_date(text: str) -> Optional[datetime]:
 def validate_edits(
     edits: dict[tuple, str], rules_by_column: dict[str, ColumnRule]
 ) -> dict[tuple, tuple[str, str]]:
-    """Validate every pending edit → {(row_id, column): (severity, msg)}."""
     findings: dict[tuple, tuple[str, str]] = {}
     for (row_id, column), new_value in edits.items():
         rule = rules_by_column.get(column)
@@ -135,7 +114,6 @@ def validate_edits(
 
 
 def errors_only(findings: dict[tuple, tuple[str, str]]) -> dict[tuple, str]:
-    """The publish-blocking subset."""
     return {k: msg for k, (sev, msg) in findings.items() if sev == ERROR}
 
 

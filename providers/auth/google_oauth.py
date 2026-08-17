@@ -1,22 +1,3 @@
-"""Google OAuth (redirect-based) auth provider.
-
-The app itself performs the full OAuth authorization-code flow — this is
-NOT the "trust a header from an external proxy" (IAP) pattern; the app
-renders a login link, Google redirects the browser back with a `code`,
-and the app exchanges that code for an ID token directly.
-
-Config (auth.google_oauth):
-    client_id_env:     GOOGLE_OAUTH_CLIENT_ID       # env var holding the client id
-    client_secret_env: GOOGLE_OAUTH_CLIENT_SECRET   # env var holding the client secret
-    client_id / client_secret: "..."                # inline fallback (avoid committing)
-    redirect_uri:       https://<your-app>/           # must exactly match the OAuth
-                                                        # client's authorized redirect URI
-
-Requires: pip install google-auth
-(google.oauth2.id_token + google.auth.transport.requests both ship in the
-`google-auth` package — NOT google-auth-oauthlib or google-api-python-client.
-The token exchange POST itself uses the project's existing `requests` dep.)
-"""
 from __future__ import annotations
 
 import os
@@ -109,11 +90,11 @@ class GoogleOAuthProvider(AuthProvider):
             claims = id_token.verify_oauth2_token(
                 raw_id_token, google_requests.Request(), self._client_id
             )
-        except Exception as exc:  # google-auth's exact exception type varies by version
+        except Exception as exc:
             raise AuthError(f"Invalid Google ID token: {exc}") from exc
 
         if claims.get("email_verified") is False:
-            return None  # rejected login, not an infra failure
+            return None
 
         email = claims.get("email")
         if not email:

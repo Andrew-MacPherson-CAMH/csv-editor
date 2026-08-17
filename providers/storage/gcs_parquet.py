@@ -1,28 +1,3 @@
-"""GCS parquet storage provider, with a BigQuery change-log audit trail.
-
-Config (storage.gcs_parquet):
-    bucket:     collab-nprod-data
-    blob_path:  collaborator_988_raw/raw_crisis_988_data/geo_coded_988_data.parquet
-    id_column:  null                      # null -> positional row ids (like local_csv)
-    change_log:
-        project:  collab-infra-nprod
-        dataset:  collaborator_988_raw
-        table:    988_change_log
-        location: US                      # optional
-
-Credentials come from Application Default Credentials (same as bigquery.py):
-    gcloud auth application-default login
-or  GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
-
-Requires: pip install google-cloud-storage google-cloud-bigquery pyarrow
-
-Every read/write moves through an in-memory `io.BytesIO` buffer only —
-never a local temp file — so there's no file handle left open, half-written,
-or orphaned on disk if something fails partway through. Writes are a single
-`upload_from_string` call, which is a single atomic GCS object PUT: readers
-never observe a partially-written object, so this needs no temp-file/rename
-dance the way a local filesystem write does.
-"""
 from __future__ import annotations
 
 import io
@@ -35,7 +10,7 @@ from providers.storage.base import ROW_ID, EditMap, StorageError, StorageProvide
 
 class GcsParquetStorageProvider(StorageProvider):
     name = "gcs_parquet"
-    audit_before_data_write = True   # change_log write happens BEFORE the parquet write
+    audit_before_data_write = True
     supports_import = True
 
     def __init__(self, settings: dict[str, Any]):
@@ -62,7 +37,6 @@ class GcsParquetStorageProvider(StorageProvider):
                 "pyarrow is not installed. Run: pip install pyarrow"
             ) from exc
 
-    # ------------------------------------------------------------- clients
 
     def _storage_client(self):
         from google.cloud import storage
@@ -87,12 +61,11 @@ class GcsParquetStorageProvider(StorageProvider):
         c = self.settings["change_log"]
         return f"{c['project']}.{c['dataset']}.{c['table']}"
 
-    # -------------------------------------------------------------- I/O
 
     def load(self) -> pd.DataFrame:
         try:
             data = self._blob().download_as_bytes()
-        except Exception as exc:  # google api errors vary by version
+        except Exception as exc:
             raise StorageError(f"GCS read failed: {exc}") from exc
 
         buf = io.BytesIO(data)
@@ -110,7 +83,6 @@ class GcsParquetStorageProvider(StorageProvider):
             df = df.set_index(df[id_column].rename(ROW_ID), drop=False)
         else:
             df.index = pd.RangeIndex(len(df), name=ROW_ID)
-        # Editing works on strings; providers normalise on the way out.
         return df.astype(str)
 
     def _write_parquet(self, df: pd.DataFrame) -> None:
@@ -135,13 +107,6 @@ class GcsParquetStorageProvider(StorageProvider):
         self._write_parquet(new_df)
 
     def write_audit(self, metadata, records) -> None:
-        """Append rows to the BigQuery change-log. `metadata` is ignored —
-        the rows from core/audit.py are already fully shaped (17 data
-        columns + change_id/change_state/change_type/changed_by/changed_at);
-        merging in generic {last_updated_at, last_updated_by} keys would add
-        columns the real change-log table's schema doesn't have, and
-        insert_rows_json would reject the row.
-        """
         if not records:
             return
         try:

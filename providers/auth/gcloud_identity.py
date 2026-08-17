@@ -1,12 +1,3 @@
-"""Google Cloud Identity Platform auth provider.
-
-Uses the Identity Toolkit REST API's email/password sign-in endpoint:
-https://cloud.google.com/identity-platform/docs/use-rest-api
-
-Config (config.yaml → auth.gcloud_identity):
-    api_key_env: GCP_IDENTITY_API_KEY   # env var holding the API key
-    api_key: "..."                      # inline fallback (avoid committing)
-"""
 from __future__ import annotations
 
 import os
@@ -20,7 +11,6 @@ _SIGN_IN_URL = (
     "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword"
 )
 
-# Identity Toolkit error codes that mean "bad credentials", not "broken setup".
 _BAD_CREDENTIAL_CODES = {
     "EMAIL_NOT_FOUND",
     "INVALID_PASSWORD",
@@ -76,5 +66,5 @@ class GcloudIdentityAuthProvider(AuthProvider):
             else ""
         )
         if any(code.startswith(c) for c in _BAD_CREDENTIAL_CODES):
-            return None  # wrong username/password — let the UI say so
+            return None
         raise AuthError(f"Identity Platform error ({resp.status_code}): {code or resp.text[:200]}")

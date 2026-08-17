@@ -1,10 +1,9 @@
-"""Storage provider registry (lazy imports — see auth/__init__.py)."""
 from __future__ import annotations
 
 from typing import Any, Callable
 
-from providers.storage.base import ROW_ID as ROW_ID  # re-export
-from providers.storage.base import EditMap as EditMap  # re-export
+from providers.storage.base import ROW_ID as ROW_ID
+from providers.storage.base import EditMap as EditMap
 from providers.storage.base import StorageError, StorageProvider
 
 _REGISTRY: dict[str, Callable[[], type]] = {
@@ -27,7 +26,6 @@ def _import(module: str, cls: str) -> type:
 
 
 def register_storage_provider(name: str, loader: Callable[[], type]) -> None:
-    """Register a custom backend: register_storage_provider('postgres', lambda: PgProvider)."""
     _REGISTRY[name] = loader
 
 

@@ -1,9 +1,3 @@
-"""Load and expose application configuration.
-
-The config file drives provider selection (auth + storage) and the
-column/validation spec, so swapping providers or updating validation
-rules requires no code changes.
-"""
 from __future__ import annotations
 
 import os
@@ -19,27 +13,18 @@ DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.yaml"
 
 @dataclass(frozen=True)
 class ColumnRule:
-    """Validation + display spec for a single column.
-
-    `type` drives BOTH the cell editor the grid opens and validation:
-        text     single-line input (default)
-        textarea multi-line text
-        enum     fixed dropdown of `options`
-        float    numeric, optional min/max
-    (legacy types string/number/integer/date remain supported)
-    """
 
     name: str
     label: str
     type: str = "text"
     required: bool = False
-    options: tuple = ()           # enum choices
+    options: tuple = ()
     min: Optional[float] = None
     max: Optional[float] = None
     max_length: Optional[int] = None
     regex: Optional[str] = None
     regex_hint: Optional[str] = None
-    normalize: Optional[str] = None   # e.g. "postal_code"
+    normalize: Optional[str] = None
     align: str = "left"
     editable: bool = True
 
@@ -67,7 +52,6 @@ class ColumnRule:
 class AppConfig:
     raw: dict[str, Any] = field(default_factory=dict)
 
-    # --- app ---
     @property
     def title(self) -> str:
         return self.raw.get("app", {}).get("title", "Data Editor")
@@ -76,7 +60,6 @@ class AppConfig:
     def subtitle(self) -> str:
         return self.raw.get("app", {}).get("subtitle", "sign in to edit the dataset")
 
-    # --- providers ---
     @property
     def auth_provider_name(self) -> str:
         return self.raw.get("auth", {}).get("provider", "mock")
@@ -93,7 +76,6 @@ class AppConfig:
         name = name or self.storage_provider_name
         return self.raw.get("storage", {}).get(name, {}) or {}
 
-    # --- dataset ---
     @property
     def dataset_display_name(self) -> str:
         return self.raw.get("dataset", {}).get("display_name", "dataset")
@@ -105,7 +87,6 @@ class AppConfig:
 
 
 def load_config(path: Optional[str | Path] = None) -> AppConfig:
-    """Load config from `path`, $CSV_EDITOR_CONFIG, or the default file."""
     cfg_path = Path(path or os.environ.get(CONFIG_ENV_VAR, DEFAULT_CONFIG_PATH))
     with open(cfg_path, "r", encoding="utf-8") as fh:
         return AppConfig(raw=yaml.safe_load(fh) or {})

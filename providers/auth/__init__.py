@@ -1,14 +1,9 @@
-"""Auth provider registry.
-
-Providers are imported lazily so an unused provider's dependencies
-(e.g. `requests` for gcloud) are never required just to run the app.
-"""
 from __future__ import annotations
 
 from typing import Any, Callable
 
 from providers.auth.base import AuthError, AuthProvider
-from providers.auth.base import User as User  # re-export
+from providers.auth.base import User as User
 
 _REGISTRY: dict[str, Callable[[], type]] = {
     "mock": lambda: _import("providers.auth.mock", "MockAuthProvider"),
@@ -28,7 +23,6 @@ def _import(module: str, cls: str) -> type:
 
 
 def register_auth_provider(name: str, loader: Callable[[], type]) -> None:
-    """Register a custom provider: register_auth_provider('okta', lambda: OktaProvider)."""
     _REGISTRY[name] = loader
 
 

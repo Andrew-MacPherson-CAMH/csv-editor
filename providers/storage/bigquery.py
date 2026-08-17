@@ -1,18 +1,3 @@
-"""BigQuery storage provider.
-
-Config (storage.bigquery):
-    project:   my-gcp-project
-    dataset:   my_dataset
-    table:     customers
-    id_column: id          # REQUIRED — stable unique key for row identity
-    location:  US
-
-Credentials come from Application Default Credentials:
-    gcloud auth application-default login
-or  GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
-
-Requires: pip install google-cloud-bigquery
-"""
 from __future__ import annotations
 
 from typing import Any
@@ -57,22 +42,19 @@ class BigQueryStorageProvider(StorageProvider):
             df = self._client().query(
                 f"SELECT * FROM {self._table_ref} ORDER BY {id_column}"
             ).to_dataframe()
-        except Exception as exc:  # google api errors vary by version
+        except Exception as exc:
             raise StorageError(f"BigQuery load failed: {exc}") from exc
 
         if df[id_column].duplicated().any():
             raise StorageError(f"id_column '{id_column}' has duplicate values")
         df = df.set_index(df[id_column].rename(ROW_ID), drop=False)
-        # Editing works on strings; providers normalise on the way out.
         return df.astype(str)
 
     def apply_edits(self, df: pd.DataFrame, edits: EditMap) -> None:
-        """Apply all edits in a single MERGE so the publish is atomic."""
         from google.cloud import bigquery
 
         id_column = self.settings["id_column"]
 
-        # Reshape {(row_id, col): value} → one patch row per edited row.
         patches: dict[Any, dict[str, Any]] = {}
         for (row_id, column), value in edits.items():
             patches.setdefault(row_id, {})[column] = value
@@ -116,12 +98,6 @@ class BigQueryStorageProvider(StorageProvider):
             raise StorageError(f"BigQuery publish failed: {exc}") from exc
 
     def write_audit(self, metadata, records) -> None:
-        """Insert one row per changed cell into `audit_table` (if set).
-
-        Rows carry the change (row_id, column, old_value, new_value,
-        timestamp, user) plus last_updated_at / last_updated_by.
-        Skipped silently when audit_table isn't configured.
-        """
         audit_table = self.settings.get("audit_table")
         if not audit_table:
             return

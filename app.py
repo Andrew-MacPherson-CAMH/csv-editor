@@ -1,21 +1,3 @@
-"""CSV Data Editor — Streamlit implementation of the IYS wireframes.
-
-Views: login (1a) → editing grid with live search (1b/2a) → review with
-diffs + validation (1c/1d) → publish confirmation dialog (1e).
-
-Auth and storage are pluggable providers selected in config.yaml.
-
-Grid approach: a plain HTML <table> (st.markdown), not a Streamlit
-dataframe widget — so every cell can carry whatever CSS we want (red
-error / amber warning / green edited backgrounds, live). Double-
-clicking a cell opens a small edit box positioned exactly over it
-(sized to the larger of the cell or its content); Tab/Enter/clicking
-away commits, Esc discards. Since the table is static HTML, "commit"
-happens over a same-origin bridge: JS writes the new value into a
-hidden st.text_input via the same trick browsers' devtools use to set
-a React-controlled input (native setter + a real `input` event), then
-blurs it, which is what actually sends the value back to Python.
-"""
 from __future__ import annotations
 
 import base64
@@ -42,7 +24,6 @@ from core.validation import (
 from providers.auth import AuthError, create_auth_provider
 from providers.storage import ROW_ID, StorageError, create_storage_provider
 
-# ---------------------------------------------------------------- tokens
 GREEN = "rgb(3,149,121)"
 GREEN_HOVER = "rgb(2,119,97)"
 EDIT_TINT = "rgb(230,245,241)"
@@ -54,8 +35,6 @@ MUTED = "rgb(161,161,161)"
 SECONDARY = "rgb(82,82,82)"
 
 st.set_page_config(page_title="Data Editor", page_icon="🗂️", layout="wide")
-
-# ------------------------------------------------------------- providers
 
 
 @st.cache_resource
@@ -75,23 +54,20 @@ def get_storage_provider():
     return create_storage_provider(cfg.storage_provider_name, cfg.storage_settings())
 
 
-# ----------------------------------------------------------------- state
-
-
 def init_state() -> None:
     ss = st.session_state
     ss.setdefault("user", None)
-    ss.setdefault("original_df", None)   # DataFrame indexed by ROW_ID
-    ss.setdefault("edits", {})           # {(row_id, column): new_value}
-    ss.setdefault("view", "editing")     # editing | review | import_upload | import_review
-    ss.setdefault("grid_ver", 0)         # bump to rotate the grid widget key
-    ss.setdefault("undo_stack", [])      # instruction objects, see undo/redo below
+    ss.setdefault("original_df", None)
+    ss.setdefault("edits", {})
+    ss.setdefault("view", "editing")
+    ss.setdefault("grid_ver", 0)
+    ss.setdefault("undo_stack", [])
     ss.setdefault("redo_stack", [])
     ss.setdefault("just_published", None)
     ss.setdefault("audit_warning", None)
-    ss.setdefault("import_df", None)     # DataFrame from an uploaded CSV, pre-publish
-    ss.setdefault("import_edits", {})    # {(row_id, column): new_value}, import-review only
-    ss.setdefault("export_ready", None)  # (csv_bytes, filename) once Export Data has run
+    ss.setdefault("import_df", None)
+    ss.setdefault("import_edits", {})
+    ss.setdefault("export_ready", None)
     ss.setdefault("export_error", None)
 
 
@@ -126,7 +102,6 @@ def df_with_edits(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def set_edit(row_id: Any, column: str, new_value: str) -> None:
-    """Commit a cell value; reverting to the original clears the edit."""
     original = str(st.session_state.original_df.at[row_id, column])
     new = "" if new_value is None else str(new_value)
     if new == original:
@@ -143,9 +118,6 @@ def esc(text: Any) -> str:
     return html.escape("" if text is None else str(text))
 
 
-# ------------------------------------------------------------------- css
-
-
 def inject_css() -> None:
     st.markdown(
         f"""
@@ -153,7 +125,6 @@ def inject_css() -> None:
         @import url('https://fonts.googleapis.com/css2?family=Open+Sans:ital,wght@0,400;0,600;1,400&display=swap');
         html, body, [class*="css"], .stApp {{ font-family: 'Open Sans', Arial, sans-serif; }}
         .stApp {{ background: rgb(241,239,234); }}
-        /* hide Streamlit's default header (deploy button / kebab menu) */
         header[data-testid="stHeader"] {{ display: none; }}
         .block-container {{ padding-top: 1.5rem; max-width: 100%; padding-bottom: 0.5rem; }}
 
@@ -201,12 +172,7 @@ def inject_css() -> None:
             background: #eee; border: 1px dashed rgb(212,212,212); color: {MUTED};
         }}
         div.stButton > button {{ border-radius: 6px; }}
-        /* button labels must never wrap to a second line (e.g. the
-           Undo/Redo buttons, which sit in narrow columns) */
         div.stButton > button p {{ white-space: nowrap; }}
-        /* Streamlit text inputs: the visible border lives on the baseweb
-           wrapper. Styling the inner <input> draws a second box on focus,
-           so target the wrapper's :focus-within instead. */
         div[data-testid="stTextInput"] div[data-baseweb="input"] {{ border-radius: 6px; }}
         div[data-testid="stTextInput"] div[data-baseweb="input"]:focus-within {{
             border-color: {GREEN}; box-shadow: 0 0 0 1px {GREEN};
@@ -214,14 +180,10 @@ def inject_css() -> None:
         div[data-testid="stTextInput"] input {{
             border: none !important; box-shadow: none !important; outline: none !important;
         }}
-        /* Edge/IE add a native password-reveal eye on top of Streamlit's
-           own toggle — hide the native one */
         input::-ms-reveal, input::-ms-clear {{ display: none !important; }}
 
-        /* kill the grid's hover toolbar (download / search / fullscreen) */
         [data-testid="stElementToolbar"] {{ display: none !important; }}
 
-        /* the user-menu popover trigger looks like the avatar circle */
         div[data-testid="stPopover"] button[data-testid="stPopoverButton"] {{
             border-radius: 50%; width: 36px; height: 36px; min-height: 36px;
             padding: 0; background: {GREEN}; border: none; color: #fff;
@@ -231,24 +193,21 @@ def inject_css() -> None:
             background: {GREEN_HOVER}; color: #fff;
         }}
         div[data-testid="stPopover"] button[data-testid="stPopoverButton"] svg {{
-            display: none;   /* hide the caret so only initials show */
+            display: none;
         }}
         div[data-testid="stForm"] {{
             border: 2px solid {GREEN}; border-radius: 8px; background: #fff;
         }}
 
-        /* the cell-bridge text_input is a plumbing widget, not UI */
         div[class*="st-key-cell_bridge"] {{
             position: absolute; width: 1px; height: 1px; overflow: hidden;
             opacity: 0; pointer-events: none;
         }}
-        /* the grid's components.html script has nothing to show */
         div[data-testid="stElementContainer"]:has(> iframe) {{
             height: 0; min-height: 0; margin: 0; padding: 0;
         }}
         div[data-testid="stElementContainer"] > iframe {{ height: 0; border: 0; display: block; }}
 
-        /* ---- HTML data grid ---- */
         .de-grid-wrap {{
             border: 1px solid rgb(229,229,229); border-radius: 8px;
             height: var(--de-grid-h, auto);
@@ -283,8 +242,6 @@ def inject_css() -> None:
         table.de-grid td.de-cell-edit {{ background: {EDIT_TINT}; }}
         table.de-grid td.de-cell-match {{ background: {MATCH_YELLOW}; }}
 
-        /* double-click popup editor — appended to <body>, position:fixed
-           over the clicked cell (see render_grid_script) */
         .de-cell-editor {{
             position: fixed; z-index: 10000; font-family: 'Open Sans', Arial, sans-serif;
             font-size: 13px; padding: 4px 7px; box-sizing: border-box;
@@ -295,9 +252,6 @@ def inject_css() -> None:
         """,
         unsafe_allow_html=True,
     )
-
-
-# ------------------------------------------------------------- login (1a)
 
 
 def _login_header(cfg: AppConfig) -> None:
@@ -353,20 +307,11 @@ def render_credential_login() -> None:
 
 
 def render_oauth_login(provider) -> None:
-    """Google's full authorization-code flow, run by this app itself (not
-    an external proxy). Every rerun re-evaluates the current query params —
-    there's no server-side "callback route", the redirect-back is just
-    another top-to-bottom script run that happens to have ?code&state set.
-    """
     cfg = get_config()
     ss = st.session_state
     result = interpret_callback(dict(st.query_params), ss.get("oauth_state"))
 
     if result.kind == OAuthCallbackKind.EXCHANGE:
-        # Clear query params before anything else: leaving a spent ?code in
-        # the URL would silently replay it through complete_login() on the
-        # next script load (e.g. logging out and back in) with no user
-        # action, producing a confusing error on a fresh login screen.
         code = result.code
         st.query_params.clear()
         ss.oauth_state = None
@@ -399,9 +344,6 @@ def render_oauth_login(provider) -> None:
             st.error(f"Sign-in is unavailable: {exc}")
             return
         st.link_button("Log in with Google", login_url, type="primary", width="stretch")
-
-
-# --------------------------------------------------------------- toolbar
 
 
 @st.dialog("Discard unpublished edits?")
@@ -504,19 +446,13 @@ def render_toolbar(subtitle: str) -> None:
         )
 
 
-# ------------------------------------------------------- grid helpers
-
-
 def column_header(rule: ColumnRule) -> str:
-    """Header label with the wireframes' type glyphs:
-    * required · ▾ dropdown · ¶ text area · #.# float."""
     glyph = {"enum": " \u25be", "textarea": " \u00b6", "float": " #.#"}.get(rule.type, "")
     star = " *" if rule.required else ""
     return f"{rule.label}{star}{glyph}"
 
 
 def cell_editor_kind(rule: ColumnRule) -> str:
-    """Which popup control the JS overlay should render for a column."""
     if rule.type in ("enum", "textarea", "float"):
         return rule.type
     return "text"
@@ -534,13 +470,6 @@ def render_html_grid(
     page: str,
     max_height: Optional[int],
 ) -> None:
-    """The grid itself: a plain HTML <table>, not a Streamlit widget, so
-    every cell's background/text color is ours to set (see module
-    docstring). `data-*` attributes carry what the JS overlay editor
-    (rendered alongside via render_grid_script) needs to open/commit an
-    edit; `page` + positional `data-pos` are how a committed edit maps
-    back to a (row_id, column) — see apply_bridge_edit().
-    """
     term_l = term.strip().lower()
     head = ['<th class="de-th de-th-pin">#</th>']
     head += [f'<th class="de-th">{esc(column_header(r))}</th>' for r in rules]
@@ -583,22 +512,11 @@ def render_html_grid(
 
 
 def render_cell_bridge() -> None:
-    """Hidden st.text_input used as a same-origin bridge: the JS overlay
-    editor writes a JSON payload into it (native-setter + `input` event,
-    then blur — see render_grid_script) to get a committed cell edit
-    from the browser back into Python, since a plain st.markdown table
-    has no widget protocol of its own to carry a value back."""
     st.text_input("cell bridge", key="cell_bridge", label_visibility="collapsed",
                    on_change=apply_bridge_edit)
 
 
 def apply_bridge_edit() -> None:
-    """Commit one cell edit from the JS overlay bridge. `page` routes the
-    edit to the right target: "editing"/"review" both patch the normal
-    edits dict (undo/redo tracked); "import" patches import_edits instead
-    (no undo/redo — the import-review page is for fixing typos before a
-    one-shot publish, not an extended editing session).
-    """
     ss = st.session_state
     raw = ss.get("cell_bridge") or ""
     if not raw:
@@ -646,12 +564,6 @@ def apply_bridge_edit() -> None:
 
 
 def render_grid_script(autosize: bool) -> None:
-    """Double-click-to-edit overlay + (on the editing page) the height
-    autosizer, both same-origin components.html scripts reaching into
-    the parent document — see module docstring for why the edit commit
-    has to go through the hidden bridge input instead of a normal
-    Streamlit return value.
-    """
     autosizer = """
         function fit() {
           const grid = doc.querySelector('.de-grid-wrap');
@@ -675,9 +587,6 @@ def render_grid_script(autosize: bool) -> None:
         f"""<script>
         const P = window.parent, doc = P.document;
         {autosizer}
-        // Keyboard shortcuts: Ctrl/Cmd+Z = undo, Ctrl/Cmd+Shift+Z or
-        // Ctrl+Y = redo. Skipped while a cell editor / input has focus
-        // so native text-field undo still works there.
         if (!P.__deKeys) {{
           P.__deKeys = true;
           doc.addEventListener('keydown', (e) => {{
@@ -797,20 +706,7 @@ def render_grid_script(autosize: bool) -> None:
     )
 
 
-# ----------------------------------------------------- undo / redo core
-#
-# Every user action on a cell pushes an *instruction object* describing
-# how to restore the cell's previous pending state, e.g.
-#     {"row": 7, "col": "seats", "inst": "MODIFY", "value": "25"}
-#     {"row": 2, "col": "email", "inst": "DELETE"}
-# DELETE = remove the pending edit (cell back to its original value);
-# MODIFY = set the pending edit to `value`. Undo pops an instruction and
-# applies it verbatim; before applying, the inverse (the cell's current
-# state) is pushed to the redo stack — and vice versa.
-
-
 def _cell_instruction(row_id, column) -> dict:
-    """Instruction that restores this cell's CURRENT pending state."""
     edits = st.session_state.edits
     if (row_id, column) in edits:
         return {"row": row_id, "col": column, "inst": "MODIFY",
@@ -826,14 +722,12 @@ def _apply_instruction(instr: dict) -> None:
     else:
         value = str(instr["value"])
         if value == str(ss.original_df.at[key[0], key[1]]):
-            ss.edits.pop(key, None)      # original value == no pending edit
+            ss.edits.pop(key, None)
         else:
             ss.edits[key] = value
 
 
 def record_action(row_id, column) -> None:
-    """Call BEFORE mutating a cell: snapshots its state for undo and
-    invalidates the redo stack (a new action forks history)."""
     ss = st.session_state
     ss.undo_stack.append(_cell_instruction(row_id, column))
     ss.redo_stack.clear()
@@ -860,14 +754,12 @@ def redo() -> None:
 
 
 def revert_edit(row_id, column) -> None:
-    """Revert one pending edit (review screen), undoably."""
     record_action(row_id, column)
     st.session_state.edits.pop((row_id, column), None)
     bump_grid()
 
 
 def render_undo_redo() -> None:
-    """Undo / redo buttons, top-left of the grid."""
     ss = st.session_state
     c1, c2, _ = st.columns([1.1, 1.1, 7.8])
     c1.button(
@@ -898,9 +790,6 @@ def filter_rows(display_df: pd.DataFrame, term: str) -> pd.DataFrame:
     return display_df[mask]
 
 
-# --------------------------------------------------------- editing (1b/2a)
-
-
 def render_editing() -> None:
     cfg = get_config()
     df = load_data()
@@ -925,11 +814,8 @@ def render_editing() -> None:
     errors = errors_only(findings)
     warnings = warnings_only(findings)
 
-    # 2a — filter status bar (edits on hidden rows are kept; badge unchanged)
     if term:
         def _clear_search():
-            # widget state may only be changed in a callback, which runs
-            # before the search input is instantiated on the next run
             st.session_state.search = ""
 
         bar = st.columns([5.5, 1])
@@ -940,23 +826,16 @@ def render_editing() -> None:
         )
         bar[1].button("Clear search", width="stretch", on_click=_clear_search)
 
-    # undo / redo — top-left of the table
     render_undo_redo()
 
-    # inline-editable grid of all (filtered) rows: double-click a cell to
-    # pop its editor open right over it; Tab/Enter/click-away commits,
-    # Esc discards. `filtered` already carries pending edits merged in.
     row_ids = list(filtered.index)
     st.session_state["_row_ids_editing"] = row_ids
     render_cell_bridge()
     render_html_grid(
         filtered, df, row_ids, cfg.columns, edits, errors, warnings, term,
-        page="editing", max_height=560,   # initial paint — the autosizer below corrects it
+        page="editing", max_height=560,
     )
     render_grid_script(autosize=True)
-
-
-# ------------------------------------------------------ review (1c/1d/1e)
 
 
 def render_review() -> None:
@@ -965,8 +844,8 @@ def render_review() -> None:
     edits = st.session_state.edits
     rules = rules_by_column()
     findings = validate_edits(edits, rules)
-    errors = errors_only(findings)          # block publish
-    warnings = warnings_only(findings)      # amber, non-blocking
+    errors = errors_only(findings)
+    warnings = warnings_only(findings)
 
     edited_row_ids = [rid for rid in df.index if any(k[0] == rid for k in edits)]
     n_rows, n_cells = len(edited_row_ids), len(edits)
@@ -1013,9 +892,6 @@ def render_review() -> None:
                     unsafe_allow_html=True)
         return
 
-    # inline-editable grid of ONLY the edited rows (new values shown;
-    # double-click to adjust further — reverting to the original clears
-    # the edit, or use ↩ in the change list below).
     page_df = df_with_edits(df.loc[edited_row_ids])
     st.session_state["_row_ids_review"] = edited_row_ids
     render_cell_bridge()
@@ -1025,7 +901,6 @@ def render_review() -> None:
     )
     render_grid_script(autosize=False)
 
-    # change list: old → new with inline validation and per-change revert
     st.markdown(
         '<div class="de-note" style="margin-top:4px;">Pending changes (old → new)</div>',
         unsafe_allow_html=True,
@@ -1121,9 +996,6 @@ def publish_dialog(n_rows: int, n_cells: int) -> None:
             st.session_state.audit_warning = outcome.audit_warning
         bump_grid()
         st.rerun()
-
-
-# --------------------------------------------------------------- import
 
 
 def render_import_upload() -> None:
@@ -1289,9 +1161,6 @@ def import_publish_dialog(final_df: pd.DataFrame) -> None:
             st.session_state.audit_warning = outcome.audit_warning
         bump_grid()
         st.rerun()
-
-
-# ------------------------------------------------------------------ main
 
 
 def main() -> None:

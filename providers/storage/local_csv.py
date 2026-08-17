@@ -1,9 +1,3 @@
-"""Local CSV storage provider (development / fallback).
-
-Config (storage.local_csv):
-    path: sample_data/customers.csv
-    id_column: null    # null → positional row ids; else a unique column
-"""
 from __future__ import annotations
 
 import json
@@ -46,7 +40,6 @@ class LocalCsvStorageProvider(StorageProvider):
         return df
 
     def _write_csv(self, df: pd.DataFrame) -> None:
-        # Atomic write: temp file in the same directory, then replace.
         target = self._path
         fd, tmp = tempfile.mkstemp(dir=target.parent, suffix=".tmp")
         try:
@@ -68,7 +61,6 @@ class LocalCsvStorageProvider(StorageProvider):
         self._write_csv(new_df)
 
     def write_audit(self, metadata, records) -> None:
-        """Append one JSON line per publish to `<csv>.audit.jsonl`."""
         audit_path = self._path.with_suffix(self._path.suffix + ".audit.jsonl")
         try:
             with open(audit_path, "a", encoding="utf-8") as fh:
