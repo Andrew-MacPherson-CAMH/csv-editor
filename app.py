@@ -5,16 +5,22 @@ diffs + validation (1c/1d) → publish confirmation dialog (1e).
 
 Auth and storage are pluggable providers selected in config.yaml.
 
-Grid approach: a styled st.dataframe with single-cell selection.
-Clicking a cell opens an inline editor beneath the grid (Enter commits).
-This keeps the wireframes' per-cell visual states (edited tint, invalid
-outline, search-match highlight), which Streamlit's data_editor cannot
-render on editable columns.
+Grid approach: a plain HTML <table> (st.markdown), not a Streamlit
+dataframe widget — so every cell can carry whatever CSS we want (red
+error / amber warning / green edited backgrounds, live). Double-
+clicking a cell opens a small edit box positioned exactly over it
+(sized to the larger of the cell or its content); Tab/Enter/clicking
+away commits, Esc discards. Since the table is static HTML, "commit"
+happens over a same-origin bridge: JS writes the new value into a
+hidden st.text_input via the same trick browsers' devtools use to set
+a React-controlled input (native setter + a real `input` event), then
+blurs it, which is what actually sends the value back to Python.
 """
 from __future__ import annotations
 
 import html
-from typing import Any
+import json
+from typing import Any, Optional
 
 import pandas as pd
 import streamlit as st
@@ -131,7 +137,7 @@ def inject_css() -> None:
         html, body, [class*="css"], .stApp {{ font-family: 'Open Sans', Arial, sans-serif; }}
         .stApp {{ background: rgb(241,239,234); }}
         /* clear Streamlit's fixed header so the toolbar isn't covered */
-        .block-container {{ padding-top: 4.5rem; max-width: 1200px; }}
+        .block-container {{ padding-top: 4.5rem; max-width: 100%; padding-bottom: 0.5rem; }}
 
         .de-card {{
             background: #fff; border: 1px solid rgb(229,229,229); border-radius: 12px;
@@ -177,6 +183,9 @@ def inject_css() -> None:
             background: #eee; border: 1px dashed rgb(212,212,212); color: {MUTED};
         }}
         div.stButton > button {{ border-radius: 6px; }}
+        /* button labels must never wrap to a second line (e.g. the
+           Undo/Redo buttons, which sit in narrow columns) */
+        div.stButton > button p {{ white-space: nowrap; }}
         /* Streamlit text inputs: the visible border lives on the baseweb
            wrapper. Styling the inner <input> draws a second box on focus,
            so target the wrapper's :focus-within instead. */
@@ -208,6 +217,61 @@ def inject_css() -> None:
         }}
         div[data-testid="stForm"] {{
             border: 2px solid {GREEN}; border-radius: 8px; background: #fff;
+        }}
+
+        /* the cell-bridge text_input is a plumbing widget, not UI */
+        div[class*="st-key-cell_bridge"] {{
+            position: absolute; width: 1px; height: 1px; overflow: hidden;
+            opacity: 0; pointer-events: none;
+        }}
+        /* the grid's components.html script has nothing to show */
+        div[data-testid="stElementContainer"]:has(> iframe) {{
+            height: 0; min-height: 0; margin: 0; padding: 0;
+        }}
+        div[data-testid="stElementContainer"] > iframe {{ height: 0; border: 0; display: block; }}
+
+        /* ---- HTML data grid ---- */
+        .de-grid-wrap {{
+            border: 1px solid rgb(229,229,229); border-radius: 8px;
+            height: var(--de-grid-h, auto);
+        }}
+        table.de-grid {{
+            border-collapse: collapse; width: 100%; font-size: 13px; table-layout: auto;
+        }}
+        table.de-grid th, table.de-grid td {{
+            border: 1px solid rgb(235,235,235); padding: 5px 8px; text-align: left;
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 260px;
+        }}
+        table.de-grid thead th {{
+            position: sticky; top: 0; background: rgb(248,248,247);
+            font-weight: 600; font-size: 11px; color: {SECONDARY}; z-index: 2;
+        }}
+        table.de-grid td.de-cell-pin, table.de-grid th.de-th-pin {{
+            position: sticky; left: 0; background: #fff; z-index: 1;
+            color: {MUTED}; text-align: right; width: 40px;
+        }}
+        table.de-grid thead th.de-th-pin {{ z-index: 3; background: rgb(248,248,247); }}
+        table.de-grid tbody tr:hover td:not(.de-cell-pin) {{ background: rgb(250,250,249); }}
+        table.de-grid td.de-cell[data-editable="1"] {{ cursor: text; }}
+        table.de-grid td.de-cell-locked {{ color: {MUTED}; cursor: not-allowed; }}
+        table.de-grid td.de-cell-err {{
+            background: {ERROR_FILL}; color: {ERROR_RED}; font-weight: 600;
+            box-shadow: inset 0 0 0 1px {ERROR_RED};
+        }}
+        table.de-grid td.de-cell-warn {{
+            background: #fef3c7; color: #b45309; font-weight: 600;
+            box-shadow: inset 0 0 0 1px #f59e0b;
+        }}
+        table.de-grid td.de-cell-edit {{ background: {EDIT_TINT}; }}
+        table.de-grid td.de-cell-match {{ background: {MATCH_YELLOW}; }}
+
+        /* double-click popup editor — appended to <body>, position:fixed
+           over the clicked cell (see render_grid_script) */
+        .de-cell-editor {{
+            position: fixed; z-index: 10000; font-family: 'Open Sans', Arial, sans-serif;
+            font-size: 13px; padding: 4px 7px; box-sizing: border-box;
+            border: 2px solid {GREEN}; border-radius: 3px; outline: none;
+            box-shadow: 0 4px 14px rgba(0,0,0,.18); background: #fff; resize: none;
         }}
         </style>
         """,
@@ -310,49 +374,265 @@ def column_header(rule: ColumnRule) -> str:
     return f"{rule.label}{star}{glyph}"
 
 
-def grid_column_config(rules: list[ColumnRule]) -> dict:
-    """Per-column editors, driven by the rule's `type` (the columnRules
-    schema is the single source of truth for editors AND validation):
-    enum → dropdown, float → number editor with min/max, everything
-    else → text. (Streamlit's grid has no multi-line cell editor, so
-    textarea columns open a single-line editor that accepts long text.)
+def cell_editor_kind(rule: ColumnRule) -> str:
+    """Which popup control the JS overlay should render for a column."""
+    if rule.type in ("enum", "textarea", "float"):
+        return rule.type
+    return "text"
+
+
+def render_html_grid(
+    page_df: pd.DataFrame,
+    base_df: pd.DataFrame,
+    row_ids: list,
+    rules: list[ColumnRule],
+    edits: dict[tuple, str],
+    errors: dict[tuple, str],
+    warnings: dict[tuple, str],
+    term: str,
+    page: str,
+    max_height: Optional[int],
+) -> None:
+    """The grid itself: a plain HTML <table>, not a Streamlit widget, so
+    every cell's background/text color is ours to set (see module
+    docstring). `data-*` attributes carry what the JS overlay editor
+    (rendered alongside via render_grid_script) needs to open/commit an
+    edit; `page` + positional `data-pos` are how a committed edit maps
+    back to a (row_id, column) — see apply_bridge_edit().
     """
-    cfg: dict = {
-        ROW_ID: st.column_config.TextColumn("#", disabled=True, width="small", pinned=True)
-    }
-    for r in rules:
-        header = column_header(r)
-        if r.type == "enum":
-            cfg[r.name] = st.column_config.SelectboxColumn(
-                header, options=list(r.options), disabled=not r.editable
+    term_l = term.strip().lower()
+    head = ['<th class="de-th de-th-pin">#</th>']
+    head += [f'<th class="de-th">{esc(column_header(r))}</th>' for r in rules]
+
+    rows_html = []
+    for pos, row_id in enumerate(row_ids):
+        cells = [f'<td class="de-cell de-cell-pin">{esc(row_number(base_df, row_id))}</td>']
+        for r in rules:
+            raw = str(page_df.at[row_id, r.name]) if row_id in page_df.index else ""
+            key = (row_id, r.name)
+            classes = ["de-cell"]
+            if key in errors:
+                classes.append("de-cell-err")
+            elif key in warnings:
+                classes.append("de-cell-warn")
+            elif key in edits:
+                classes.append("de-cell-edit")
+            elif term_l and term_l in raw.lower():
+                classes.append("de-cell-match")
+            if not r.editable:
+                classes.append("de-cell-locked")
+            opts_attr = ""
+            if r.type == "enum":
+                opts_attr = f' data-options="{esc(json.dumps(list(r.options)))}"'
+            cells.append(
+                f'<td class="{" ".join(classes)}" data-pos="{pos}" data-col="{esc(r.name)}" '
+                f'data-editable="{"1" if r.editable else "0"}" '
+                f'data-type="{cell_editor_kind(r)}"{opts_attr} '
+                f'data-value="{esc(raw)}">{esc(raw)}</td>'
             )
-        elif r.type == "float":
-            cfg[r.name] = st.column_config.NumberColumn(
-                header,
-                min_value=r.min,
-                max_value=r.max,
-                format="%g",
-                disabled=not r.editable,
-            )
-        elif r.type == "textarea":
-            cfg[r.name] = st.column_config.TextColumn(
-                header, width="large", disabled=not r.editable
-            )
-        else:
-            cfg[r.name] = st.column_config.TextColumn(header, disabled=not r.editable)
-    return cfg
+        rows_html.append(f"<tr>{''.join(cells)}</tr>")
+
+    wrap_style = f"max-height:{max_height}px;overflow-y:auto;" if max_height else ""
+    st.markdown(
+        f'<div class="de-grid-wrap" style="{wrap_style}" data-gridpage="{page}">'
+        f'<table class="de-grid"><thead><tr>{"".join(head)}</tr></thead>'
+        f'<tbody>{"".join(rows_html)}</tbody></table></div>',
+        unsafe_allow_html=True,
+    )
 
 
-def build_grid(page_df: pd.DataFrame, base_df: pd.DataFrame) -> pd.DataFrame:
-    """Grid frame: '#' (original row number) first, data columns after.
-    Float columns get numeric dtype so the number editor works."""
-    grid = page_df.drop(columns=[ROW_ID], errors="ignore").astype(str)
-    for rule in get_config().columns:
-        if rule.type == "float" and rule.name in grid.columns:
-            grid[rule.name] = pd.to_numeric(grid[rule.name], errors="coerce")
-    numbers = [str(row_number(base_df, rid)) for rid in page_df.index]
-    grid.insert(0, ROW_ID, numbers)
-    return grid
+def render_cell_bridge() -> None:
+    """Hidden st.text_input used as a same-origin bridge: the JS overlay
+    editor writes a JSON payload into it (native-setter + `input` event,
+    then blur — see render_grid_script) to get a committed cell edit
+    from the browser back into Python, since a plain st.markdown table
+    has no widget protocol of its own to carry a value back."""
+    st.text_input("cell bridge", key="cell_bridge", label_visibility="collapsed",
+                   on_change=apply_bridge_edit)
+
+
+def apply_bridge_edit() -> None:
+    ss = st.session_state
+    raw = ss.get("cell_bridge") or ""
+    if not raw:
+        return
+    try:
+        payload = json.loads(raw)
+        page, pos, column, value = (
+            payload["page"], int(payload["pos"]), payload["col"], payload["value"],
+        )
+    except (ValueError, KeyError, TypeError):
+        return
+    row_ids = ss.get(f"_row_ids_{page}")
+    if not row_ids or not (0 <= pos < len(row_ids)):
+        return
+    row_id = row_ids[pos]
+    rule = rules_by_column().get(column)
+    if rule is None or not rule.editable:
+        return
+    original = ss.original_df
+    new = normalize_value(value, rule)
+    current = ss.edits.get((row_id, column), str(original.at[row_id, column]))
+    if new == str(current):
+        return
+    record_action(row_id, column)
+    if new == str(original.at[row_id, column]):
+        ss.edits.pop((row_id, column), None)
+    else:
+        ss.edits[(row_id, column)] = new
+    bump_grid()
+
+
+def render_grid_script(autosize: bool) -> None:
+    """Double-click-to-edit overlay + (on the editing page) the height
+    autosizer, both same-origin components.html scripts reaching into
+    the parent document — see module docstring for why the edit commit
+    has to go through the hidden bridge input instead of a normal
+    Streamlit return value.
+    """
+    autosizer = """
+        function fit() {
+          const grid = doc.querySelector('.de-grid-wrap');
+          if (!grid) return;
+          const top = grid.getBoundingClientRect().top;
+          const h = Math.max(P.innerHeight - top - 16, 220);
+          doc.documentElement.style.setProperty('--de-grid-h', h + 'px');
+        }
+        function fitTwice() { fit(); P.requestAnimationFrame(fit); }
+        fitTwice();
+        P.addEventListener('resize', fitTwice);
+        if (P.__deFitObserver) P.__deFitObserver.disconnect();
+        P.__deFitObserver = new P.MutationObserver(() => {
+          P.clearTimeout(P.__deFitTimer);
+          P.__deFitTimer = P.setTimeout(fitTwice, 80);
+        });
+        P.__deFitObserver.observe(doc.body, { childList: true, subtree: true });
+    """ if autosize else ""
+
+    st.iframe(
+        f"""<script>
+        const P = window.parent, doc = P.document;
+        {autosizer}
+        // Keyboard shortcuts: Ctrl/Cmd+Z = undo, Ctrl/Cmd+Shift+Z or
+        // Ctrl+Y = redo. Skipped while a cell editor / input has focus
+        // so native text-field undo still works there.
+        if (!P.__deKeys) {{
+          P.__deKeys = true;
+          doc.addEventListener('keydown', (e) => {{
+            if (!(e.ctrlKey || e.metaKey)) return;
+            const k = e.key.toLowerCase();
+            if (k !== 'z' && k !== 'y') return;
+            const t = e.target;
+            if (t && t.closest && t.closest('input, textarea, [contenteditable="true"]')) return;
+            const wantRedo = k === 'y' || (k === 'z' && e.shiftKey);
+            const btn = [...doc.querySelectorAll('button')].find(b =>
+              b.textContent.trim().startsWith(wantRedo ? '↷' : '↶'));
+            if (btn && !btn.disabled) {{ e.preventDefault(); btn.click(); }}
+          }}, true);
+        }}
+
+        function findBridgeInput() {{
+          const wrap = doc.querySelector('div[class*="st-key-cell_bridge"]');
+          return wrap ? wrap.querySelector('input') : null;
+        }}
+        function setNativeValue(el, value) {{
+          const proto = Object.getPrototypeOf(el);
+          const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+          desc.set.call(el, value);
+          el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+        }}
+        function sendEdit(payload) {{
+          const input = findBridgeInput();
+          if (!input) return;
+          setNativeValue(input, JSON.stringify(payload));
+          input.focus();
+          input.blur();
+        }}
+
+        function commitAndClose(ed, save) {{
+          if (!ed || !ed.isConnected) return;
+          ed.onblur = null;
+          const cell = ed.__deCell;
+          if (save) {{
+            const val = ed.value;
+            cell.textContent = val;
+            cell.dataset.value = val;
+            sendEdit({{
+              page: cell.closest('[data-gridpage]').dataset.gridpage,
+              pos: parseInt(cell.dataset.pos, 10),
+              col: cell.dataset.col,
+              value: val,
+            }});
+          }}
+          ed.remove();
+        }}
+
+        function openEditor(cell) {{
+          const existing = doc.querySelector('.de-cell-editor');
+          if (existing) commitAndClose(existing, true);
+
+          const rect = cell.getBoundingClientRect();
+          const type = cell.dataset.type;
+          let ed;
+          if (type === 'enum') {{
+            ed = doc.createElement('select');
+            const options = JSON.parse(cell.dataset.options || '[]');
+            for (const opt of options) {{
+              const o = doc.createElement('option');
+              o.value = opt; o.textContent = opt;
+              if (opt === cell.dataset.value) o.selected = true;
+              ed.appendChild(o);
+            }}
+          }} else if (type === 'textarea') {{
+            ed = doc.createElement('textarea');
+            ed.value = cell.dataset.value;
+          }} else {{
+            ed = doc.createElement('input');
+            ed.type = type === 'float' ? 'number' : 'text';
+            if (type === 'float') ed.step = 'any';
+            ed.value = cell.dataset.value;
+          }}
+          ed.className = 'de-cell-editor';
+          ed.__deCell = cell;
+
+          doc.body.appendChild(ed);
+          ed.style.position = 'fixed';
+          ed.style.left = rect.left + 'px';
+          ed.style.top = rect.top + 'px';
+          const natW = ed.scrollWidth, natH = ed.scrollHeight;
+          ed.style.width = Math.max(rect.width, natW, 80) + 'px';
+          ed.style.height = Math.max(rect.height, natH) + 'px';
+
+          ed.addEventListener('keydown', (e) => {{
+            if (e.key === 'Escape') {{
+              e.preventDefault();
+              commitAndClose(ed, false);
+            }} else if (e.key === 'Enter' && !(type === 'textarea' && e.shiftKey)) {{
+              e.preventDefault();
+              commitAndClose(ed, true);
+            }} else if (e.key === 'Tab') {{
+              e.preventDefault();
+              commitAndClose(ed, true);
+            }}
+          }});
+          ed.onblur = () => commitAndClose(ed, true);
+
+          ed.focus();
+          if (ed.select) ed.select();
+        }}
+
+        if (!P.__deTableBound) {{
+          P.__deTableBound = true;
+          doc.addEventListener('dblclick', (e) => {{
+            const cell = e.target.closest('.de-cell[data-editable="1"]');
+            if (!cell || cell.classList.contains('de-cell-pin')) return;
+            e.preventDefault();
+            openEditor(cell);
+          }});
+        }}
+        </script>""",
+        height=1,
+    )
 
 
 # ----------------------------------------------------- undo / redo core
@@ -417,36 +697,6 @@ def redo() -> None:
     bump_grid()
 
 
-def harvest_editor(widget_key: str, row_ids: list) -> None:
-    """Merge a data_editor's changes into the global edits map.
-
-    Runs on every committed cell (Enter / click away). Each real change
-    is recorded on the undo stack first. Typing the original value back
-    clears the cell's edited state, per spec.
-    """
-    ss = st.session_state
-    state = ss.get(widget_key, {})
-    original = ss.original_df
-    for pos, changes in state.get("edited_rows", {}).items():
-        row_id = row_ids[int(pos)]
-        for column, value in changes.items():
-            if column not in original.columns:
-                continue
-            rule = rules_by_column().get(column)
-            new = normalize_value(value, rule) if rule else (
-                "" if value is None else str(value).strip()
-            )
-            current = ss.edits.get((row_id, column), str(original.at[row_id, column]))
-            if new == str(current):
-                continue                      # no actual change
-            record_action(row_id, column)
-            if new == str(original.at[row_id, column]):
-                ss.edits.pop((row_id, column), None)   # revert -> clear
-            else:
-                ss.edits[(row_id, column)] = new
-    bump_grid()
-
-
 def revert_edit(row_id, column) -> None:
     """Revert one pending edit (review screen), undoably."""
     record_action(row_id, column)
@@ -457,17 +707,17 @@ def revert_edit(row_id, column) -> None:
 def render_undo_redo() -> None:
     """Undo / redo buttons, top-left of the grid."""
     ss = st.session_state
-    c1, c2, _ = st.columns([0.55, 0.55, 8])
+    c1, c2, _ = st.columns([1.1, 1.1, 7.8])
     c1.button(
         "↶ Undo",
-        width="stretch",
+        width="content",
         disabled=not ss.undo_stack,
         help=f"{len(ss.undo_stack)} step{'s' if len(ss.undo_stack) != 1 else ''} to undo",
         on_click=undo,
     )
     c2.button(
         "↷ Redo",
-        width="stretch",
+        width="content",
         disabled=not ss.redo_stack,
         help=f"{len(ss.redo_stack)} step{'s' if len(ss.redo_stack) != 1 else ''} to redo",
         on_click=redo,
@@ -507,13 +757,18 @@ def render_editing() -> None:
     term = (st.session_state.get("search") or "").strip()
     filtered = filter_rows(display, term)
 
+    rules = rules_by_column()
+    edits = st.session_state.edits
+    findings = validate_edits(edits, rules)
+    errors = errors_only(findings)
+    warnings = warnings_only(findings)
+
     # 2a — filter status bar (edits on hidden rows are kept; badge unchanged)
     if term:
         def _clear_search():
             # widget state may only be changed in a callback, which runs
             # before the search input is instantiated on the next run
             st.session_state.search = ""
-            bump_grid()
 
         bar = st.columns([5.5, 1])
         bar[0].markdown(
@@ -526,96 +781,17 @@ def render_editing() -> None:
     # undo / redo — top-left of the table
     render_undo_redo()
 
-    # inline-editable grid of all (filtered) rows: type directly in a
-    # cell, Enter or clicking away commits
-    grid = build_grid(filtered, df)
+    # inline-editable grid of all (filtered) rows: double-click a cell to
+    # pop its editor open right over it; Tab/Enter/click-away commits,
+    # Esc discards. `filtered` already carries pending edits merged in.
     row_ids = list(filtered.index)
-    widget_key = f"grid_{st.session_state.grid_ver}"
-    st.data_editor(
-        grid,
-        key=widget_key,
-        column_config=grid_column_config(cfg.columns),
-        num_rows="fixed",
-        hide_index=True,
-        width="stretch",
-        height=560,   # initial paint only — the autosizer below corrects it
-        on_change=harvest_editor,
-        args=(widget_key, row_ids),
+    st.session_state["_row_ids_editing"] = row_ids
+    render_cell_bridge()
+    render_html_grid(
+        filtered, df, row_ids, cfg.columns, edits, errors, warnings, term,
+        page="editing", max_height=560,   # initial paint — the autosizer below corrects it
     )
-
-    # Autosizer: measured in the browser, not guessed in CSS. Sets the
-    # grid height to (viewport bottom − grid top − footer height), and
-    # refits on window resize and on Streamlit re-renders (the grid key
-    # rotates every commit, remounting the element). components.html JS
-    # runs in a same-origin iframe, so it can reach the parent document.
-    st.iframe(
-        """<script>
-        const P = window.parent, doc = P.document;
-        function fit() {
-          const grid = doc.querySelector('div[data-testid="stDataFrame"]');
-          if (!grid) return;
-          const top = grid.getBoundingClientRect().top;
-          const h = Math.max(P.innerHeight - top - 16, 220);
-          // Set a CSS variable only; the stylesheet applies it with
-          // !important, which React's plain inline styles can't override.
-          doc.documentElement.style.setProperty('--de-grid-h', h + 'px');
-        }
-        function fitTwice() { fit(); P.requestAnimationFrame(fit); }
-        fitTwice();
-        P.addEventListener('resize', fitTwice);
-        // Keyboard shortcuts: Ctrl/Cmd+Z = undo, Ctrl/Cmd+Shift+Z or
-        // Ctrl+Y = redo. Skipped while a cell editor / input has focus
-        // so native text-field undo still works there.
-        if (!P.__deKeys) {
-          P.__deKeys = true;
-          doc.addEventListener('keydown', (e) => {
-            if (!(e.ctrlKey || e.metaKey)) return;
-            const k = e.key.toLowerCase();
-            if (k !== 'z' && k !== 'y') return;
-            const t = e.target;
-            if (t && t.closest && t.closest('input, textarea, [contenteditable="true"]')) return;
-            const wantRedo = k === 'y' || (k === 'z' && e.shiftKey);
-            const btn = [...doc.querySelectorAll('button')].find(b =>
-              b.textContent.trim().startsWith(wantRedo ? '\u21b7' : '\u21b6'));
-            if (btn && !btn.disabled) { e.preventDefault(); btn.click(); }
-          }, true);
-        }
-        if (P.__deFitObserver) P.__deFitObserver.disconnect();
-        P.__deFitObserver = new P.MutationObserver(() => {
-          P.clearTimeout(P.__deFitTimer);
-          P.__deFitTimer = P.setTimeout(fitTwice, 80);
-        });
-        P.__deFitObserver.observe(doc.body, { childList: true, subtree: true });
-        </script>""",
-        height=1,
-    )
-
-    # editing view uses the full width; hide the sizer iframe's slot
-    st.markdown(
-        """<style>
-        div.block-container { max-width: 100%; padding-bottom: 0.5rem; }
-        div[data-testid="stElementContainer"]:has(> iframe) {
-            height: 0; min-height: 0; margin: 0; padding: 0;
-        }
-        div[data-testid="stElementContainer"] > iframe { height: 0; border: 0; display: block; }
-
-        /* Grid height from the autosizer's CSS variable. Stylesheet
-           !important beats the React component's plain inline styles,
-           so re-renders can't snap the container back to its initial
-           height. Scoped by the grid widget's st-key class; applied to
-           every wrapper down to the resizable so the outer container
-           truly grows/shrinks and the footer reflows beneath it. */
-        div[class*="st-key-grid_"],
-        div[class*="st-key-grid_"] [data-testid="stFullScreenFrame"],
-        div[class*="st-key-grid_"] [data-testid="stDataFrame"],
-        div[class*="st-key-grid_"] [data-testid="stDataFrameResizable"] {
-            height: var(--de-grid-h, 560px) !important;
-            max-height: none !important;
-            min-height: 0 !important;
-        }
-        </style>""",
-        unsafe_allow_html=True,
-    )
+    render_grid_script(autosize=True)
 
 
 # ------------------------------------------------------ review (1c/1d/1e)
@@ -676,22 +852,16 @@ def render_review() -> None:
         return
 
     # inline-editable grid of ONLY the edited rows (new values shown;
-    # type to adjust further — reverting to the original clears the edit
-    # and drops the cell, or use ↩ in the change list below)
+    # double-click to adjust further — reverting to the original clears
+    # the edit, or use ↩ in the change list below).
     page_df = df_with_edits(df.loc[edited_row_ids])
-    grid = build_grid(page_df, df)
-    widget_key = f"review_grid_{st.session_state.grid_ver}"
-    st.data_editor(
-        grid,
-        key=widget_key,
-        column_config=grid_column_config(cfg.columns),
-        num_rows="fixed",
-        hide_index=True,
-        width="stretch",
-        height="content",
-        on_change=harvest_editor,
-        args=(widget_key, edited_row_ids),
+    st.session_state["_row_ids_review"] = edited_row_ids
+    render_cell_bridge()
+    render_html_grid(
+        page_df, df, edited_row_ids, cfg.columns, edits, errors, warnings, "",
+        page="review", max_height=None,
     )
+    render_grid_script(autosize=False)
 
     # change list: old → new with inline validation and per-change revert
     st.markdown(
@@ -710,19 +880,28 @@ def render_review() -> None:
         warn = warnings.get((row_id, column))
         note_html = ""
         accent = ""
+        new_style = ""
         if err:
             note_html = f'<div class="de-diff-err">✗ {esc(err)}</div>'
-            accent = f'background:{ERROR_FILL};border-left:3px solid {ERROR_RED};padding-left:8px;'
+            accent = f'border-left:3px solid {ERROR_RED};padding-left:8px;'
+            new_style = (
+                f'background:{ERROR_FILL};color:{ERROR_RED};border:1px solid {ERROR_RED};'
+                'border-radius:4px;padding:1px 6px;'
+            )
         elif warn:
             note_html = f'<div style="color:#b45309;font-size:11px;">⚠ {esc(warn)}</div>'
-            accent = f'background:{ERROR_FILL};border-left:3px solid #f59e0b;padding-left:8px;'
+            accent = 'border-left:3px solid #f59e0b;padding-left:8px;'
+            new_style = (
+                'background:#fef3c7;color:#b45309;border:1px solid #f59e0b;'
+                'border-radius:4px;padding:1px 6px;'
+            )
         c1, c2 = st.columns([8, 0.6])
         c1.markdown(
             f'<div style="font-size:13px;padding-top:4px;{accent}">'
             f'<span style="color:{MUTED};">row {row_number(df, row_id)}</span> · '
             f'<b>{esc(label)}</b>: '
             f'<span class="de-diff-old">{old_disp}</span> → '
-            f'<span class="de-diff-new">{new_disp}</span>{note_html}</div>',
+            f'<span class="de-diff-new" style="{new_style}">{new_disp}</span>{note_html}</div>',
             unsafe_allow_html=True,
         )
         c2.button(
