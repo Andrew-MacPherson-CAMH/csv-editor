@@ -18,6 +18,7 @@ blurs it, which is what actually sends the value back to Python.
 """
 from __future__ import annotations
 
+import base64
 import html
 import json
 import secrets
@@ -90,7 +91,7 @@ def init_state() -> None:
     ss.setdefault("audit_warning", None)
     ss.setdefault("import_df", None)     # DataFrame from an uploaded CSV, pre-publish
     ss.setdefault("import_edits", {})    # {(row_id, column): new_value}, import-review only
-    ss.setdefault("export_ready", None)  # (csv_bytes, filename) once Export data has run
+    ss.setdefault("export_ready", None)  # (csv_bytes, filename) once Export Data has run
     ss.setdefault("export_error", None)
 
 
@@ -152,8 +153,9 @@ def inject_css() -> None:
         @import url('https://fonts.googleapis.com/css2?family=Open+Sans:ital,wght@0,400;0,600;1,400&display=swap');
         html, body, [class*="css"], .stApp {{ font-family: 'Open Sans', Arial, sans-serif; }}
         .stApp {{ background: rgb(241,239,234); }}
-        /* clear Streamlit's fixed header so the toolbar isn't covered */
-        .block-container {{ padding-top: 4.5rem; max-width: 100%; padding-bottom: 0.5rem; }}
+        /* hide Streamlit's default header (deploy button / kebab menu) */
+        header[data-testid="stHeader"] {{ display: none; }}
+        .block-container {{ padding-top: 1.5rem; max-width: 100%; padding-bottom: 0.5rem; }}
 
         .de-card {{
             background: #fff; border: 1px solid rgb(229,229,229); border-radius: 12px;
@@ -441,7 +443,7 @@ def render_toolbar(subtitle: str) -> None:
             on_change=bump_grid,
         )
     with c_export:
-        if st.button("Export data", width="stretch",
+        if st.button("Export CSV", type="primary", width="stretch",
                       help="Download the latest published data as CSV"):
             try:
                 fresh = provider.load()
@@ -456,7 +458,7 @@ def render_toolbar(subtitle: str) -> None:
                 st.session_state.export_error = None
     with c_import:
         if st.button(
-            "Import Data", width="stretch", disabled=not provider.supports_import,
+            "Import CSV", type="primary", width="stretch", disabled=not provider.supports_import,
             help=None if provider.supports_import
             else "This storage backend doesn't support importing a full dataset",
         ):
@@ -489,9 +491,16 @@ def render_toolbar(subtitle: str) -> None:
         st.session_state.export_error = None
     if st.session_state.export_ready:
         data, filename = st.session_state.export_ready
-        st.download_button(
-            f"⬇ Download {filename}", data=data, file_name=filename, mime="text/csv",
-            key="export_download",
+        st.session_state.export_ready = None
+        b64 = base64.b64encode(data).decode()
+        st.iframe(
+            f"""<script>
+            const link = document.createElement('a');
+            link.href = "data:text/csv;base64,{b64}";
+            link.download = "{filename}";
+            link.click();
+            </script>""",
+            height=1,
         )
 
 
@@ -1141,7 +1150,7 @@ def render_import_upload() -> None:
     )
     uploaded = st.file_uploader("Choose a CSV file", type=["csv"], key="import_uploader")
 
-    c1, c2 = st.columns([1, 5])
+    c1, c2, _ = st.columns([1, 1, 4])
     if c1.button("Cancel", width="stretch"):
         st.session_state.view = "editing"
         st.rerun()

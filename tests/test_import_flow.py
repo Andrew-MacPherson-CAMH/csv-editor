@@ -47,7 +47,7 @@ def _dummy_csv_bytes() -> bytes:
 
 def test_import_button_navigates_to_upload_page():
     at = _fresh_logged_in()
-    import_btn = [b for b in at.button if b.label == "Import Data"][0]
+    import_btn = [b for b in at.button if b.label == "Import CSV"][0]
     assert not import_btn.disabled   # local_csv supports_import = True
     at = import_btn.click().run()
     assert not at.exception
@@ -126,7 +126,7 @@ def test_importing_with_unpublished_edits_prompts_a_confirm_dialog():
     at.session_state["edits"] = {(2, "website"): "https://x.example.ca"}
     at = at.run()
 
-    import_btn = [b for b in at.button if b.label == "Import Data"][0]
+    import_btn = [b for b in at.button if b.label == "Import CSV"][0]
     at = import_btn.click().run()
     assert not at.exception
     # Still on the editing view -- navigation waits for the dialog's choice.

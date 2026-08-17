@@ -23,7 +23,7 @@ Log in with `admin` / `admin` (the dev `mock` auth provider). The default storag
 | Wireframe | Where |
 |---|---|
 | 1a Login | centered card, logo mark, email/password (`mock`/`gcloud_identity`) or a "Log in with Google" button (`google_oauth`) |
-| 1b Editing | toolbar (title, file info, search, Export data, Import Data, "Review changes (n)" badge, avatar), grid |
+| 1b Editing | toolbar (title, file info, search, Export Data, Import Data, "Review changes (n)" badge, avatar), grid |
 | 2a Search | as-you-type filtering, blue filter bar (`Showing x of n rows matching "…"`), Clear search, yellow match highlighting; **edits on hidden rows are kept and the badge count is unchanged** |
 | 1c Review | only edited rows, green-tinted changed cells showing `old → new`, cells still editable, summary "n rows · m cells changed", plus a diff panel with struck-through old values |
 | 1d Validation | invalid cells get the red fill + outline + inline `✗ …` message; summary turns red ("k cells invalid"); Publish disabled (grey, dashed border) |
@@ -132,11 +132,11 @@ CSV **import** runs the exact same rules against every cell of the whole uploade
 
 ## Export
 
-The toolbar's "Export data" button re-fetches the dataset **fresh from the storage provider** (not the current session's in-progress edits — export reflects the latest *published* state) and offers it as a download named `988-Export-{UTC timestamp}.csv`, via `st.download_button` (which already sets the correct `Content-Disposition: attachment` header — no custom download route needed). It's a two-click action: the first click fetches and prepares the file, the second (the download button that then appears) actually downloads it — `st.download_button`'s data has to be ready at render time, so a true one-click "fetch then download" isn't possible without either this pattern or re-fetching on every rerun of the page.
+The toolbar's "Export CSV" button re-fetches the dataset **fresh from the storage provider** (not the current session's in-progress edits — export reflects the latest *published* state), builds the CSV named `988-Export-{UTC timestamp}.csv`, and triggers the browser download immediately in the same click — via `st.iframe` embedding a small script that creates and auto-clicks a `data:` URI download link (rather than `st.download_button`, which would need a second click since its data has to be ready at render time, before the fetch happens).
 
 ## Import
 
-"Import Data" (disabled if the active storage provider doesn't support it — `local_csv` and `gcs_parquet` do, `bigquery` doesn't) opens a dedicated page:
+"Import CSV" (disabled if the active storage provider doesn't support it — `local_csv` and `gcs_parquet` do, `bigquery` doesn't) opens a dedicated page:
 
 1. **Upload** a CSV (`.csv` only — enforced by the file picker). If you have unpublished edits, you'll be asked to confirm discarding them first.
 2. **Column check**: the file's columns must exactly match the 17 configured columns — both missing and unexpected columns are rejected, listed by name in plain language.
