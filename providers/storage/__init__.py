@@ -3,12 +3,9 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from providers.storage.base import (  # re-export
-    ROW_ID,
-    EditMap,
-    StorageError,
-    StorageProvider,
-)
+from providers.storage.base import ROW_ID as ROW_ID  # re-export
+from providers.storage.base import EditMap as EditMap  # re-export
+from providers.storage.base import StorageError, StorageProvider
 
 _REGISTRY: dict[str, Callable[[], type]] = {
     "local_csv": lambda: _import(
@@ -16,6 +13,9 @@ _REGISTRY: dict[str, Callable[[], type]] = {
     ),
     "bigquery": lambda: _import(
         "providers.storage.bigquery", "BigQueryStorageProvider"
+    ),
+    "gcs_parquet": lambda: _import(
+        "providers.storage.gcs_parquet", "GcsParquetStorageProvider"
     ),
 }
 

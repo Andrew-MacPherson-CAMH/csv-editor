@@ -1,7 +1,20 @@
 """Auth provider interface.
 
+Two login shapes are supported:
+  * Credential providers (the default): a synchronous authenticate(username,
+    password) call, driven by a form. Subclass AuthProvider and implement
+    authenticate() — see mock.py / gcloud_identity.py.
+  * Redirect providers (e.g. an OAuth code-exchange flow): login spans a
+    browser redirect away from and back to the app, so it can't be a single
+    call. Set redirect_based = True and implement get_login_url()/
+    complete_login() instead; authenticate() is never called for these. The
+    CSRF `state` value is generated/stored/compared by the caller (app.py's
+    st.session_state) — providers only ever see a plain string, which keeps
+    this method provider-agnostic and unit-testable without Streamlit.
+
 To add a provider:
-  1. Subclass AuthProvider and implement authenticate().
+  1. Subclass AuthProvider and implement authenticate() (or the redirect
+     pair, for a redirect-based provider).
   2. Register it in providers/auth/__init__.py.
   3. Point `auth.provider` at it in config.yaml.
 """
@@ -35,9 +48,10 @@ class AuthError(Exception):
 
 
 class AuthProvider(ABC):
-    """Username/password authentication backend."""
+    """Authentication backend — credential form or redirect-based."""
 
     name: str = "base"
+    redirect_based: bool = False   # True => use get_login_url/complete_login
 
     def __init__(self, settings: dict[str, Any]):
         self.settings = settings
@@ -48,6 +62,19 @@ class AuthProvider(ABC):
 
         Raise AuthError for infrastructure problems (bad config,
         network failure) so the UI can distinguish them from a wrong
-        password.
+        password. Not used by redirect_based providers.
         """
+        raise NotImplementedError
+
+    def get_login_url(self, state: str) -> str:
+        """Redirect-based providers only: the URL to send the browser to,
+        embedding `state` (an opaque CSRF token the caller will verify on
+        the way back)."""
+        raise NotImplementedError
+
+    def complete_login(self, code: str) -> Optional[User]:
+        """Redirect-based providers only: exchange the authorization `code`
+        from the redirect-back for a User. Same None/AuthError convention
+        as authenticate() — None for a rejected login, AuthError for an
+        infrastructure failure."""
         raise NotImplementedError

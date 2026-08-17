@@ -1,0 +1,29 @@
+# Setup (once per clone):
+#   pip install -r requirements-dev.txt
+#   pre-commit install
+#
+# Runs automatically on `git commit`, scoped to staged files only. To run
+# everything by hand (e.g. after changing this file):
+#   pre-commit run --all-files
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.3
+    hooks:
+      - id: ruff
+        name: ruff lint (staged Python files)
+
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest (full suite, runs when any staged file could affect it)
+        description: >
+          Pytest has no reliable "run only the tests touched by these files"
+          mode for this codebase (tests aren't organized 1:1 with source
+          files), so this runs the whole suite -- but ONLY when a commit
+          actually stages a Python file under app.py/core/providers/tests,
+          same "affected files" scoping pre-commit applies to the lint hook.
+          The full suite runs in a few seconds here, so this is cheap.
+        entry: python -m pytest tests/ -q
+        language: system
+        pass_filenames: false
+        files: '^(app\.py|core/|providers/|tests/).*\.py$'

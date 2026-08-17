@@ -7,12 +7,16 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from providers.auth.base import AuthError, AuthProvider, User  # re-export
+from providers.auth.base import AuthError, AuthProvider
+from providers.auth.base import User as User  # re-export
 
 _REGISTRY: dict[str, Callable[[], type]] = {
     "mock": lambda: _import("providers.auth.mock", "MockAuthProvider"),
     "gcloud_identity": lambda: _import(
         "providers.auth.gcloud_identity", "GcloudIdentityAuthProvider"
+    ),
+    "google_oauth": lambda: _import(
+        "providers.auth.google_oauth", "GoogleOAuthProvider"
     ),
 }
 

@@ -39,7 +39,7 @@ One line selects the provider; each provider then reads only its own settings bl
 
 ```yaml
 auth:
-  provider: mock            # ← change this: mock | gcloud_identity
+  provider: mock            # ← change this: mock | gcloud_identity | google_oauth
 ```
 
 ### `mock` — development only
@@ -81,6 +81,32 @@ The API key comes from your Google Cloud project (Identity Platform → Applicat
 
 **Note:** the signed-in email is what gets written to `last_updated_by` in the audit metadata, so production should use real emails via `gcloud_identity`.
 
+### `google_oauth` — Google OAuth, run by this app (988 GCP deployment)
+
+The app itself performs the full OAuth authorization-code flow: it renders a "Log in with Google" link, Google redirects the browser back with `?code&state`, and the app exchanges the code for an ID token directly. This is **not** the "trust a header from an external proxy" (IAP) pattern — there is no fronting proxy involved.
+
+```yaml
+auth:
+  provider: google_oauth
+  google_oauth:
+    client_id_env: GOOGLE_OAUTH_CLIENT_ID
+    client_secret_env: GOOGLE_OAUTH_CLIENT_SECRET
+    # client_id / client_secret: "..."     # inline fallback — avoid committing
+    redirect_uri: https://<your-cloud-run-service>/
+```
+
+```bash
+pip install google-auth
+export GOOGLE_OAUTH_CLIENT_ID="....apps.googleusercontent.com"
+export GOOGLE_OAUTH_CLIENT_SECRET="...."
+```
+
+- `redirect_uri` must **exactly** match an authorized redirect URI configured on the OAuth client in Google Cloud Console (Credentials → OAuth 2.0 Client IDs).
+- Requires an OAuth consent screen (Internal, for a Workspace-only deployment, or External). `openid`/`email`/`profile` are Google's non-sensitive scope bucket, so no app-verification review is required even for an External consent screen.
+- A rejected/cancelled login and a CSRF `state` mismatch both show a plain-language error and return to the login button; they don't crash the app.
+- **Multi-replica deployments (Cloud Run) must enable session affinity.** The CSRF `state` value round-trips through `st.session_state`, which lives in-process on whichever server instance handled the initial click; if the redirect-back lands on a *different* instance without session affinity, login fails unpredictably.
+- See the README's "GCP deployment" section for the end-to-end setup (consent screen, credentials, IAM, deploy).
+
 ### Adding a new auth provider (e.g. Okta, Azure AD)
 
 No config-only path — it's ~20 lines of code, then config:
@@ -100,7 +126,7 @@ No config-only path — it's ~20 lines of code, then config:
 
 ```yaml
 storage:
-  provider: local_csv       # ← change this: local_csv | bigquery
+  provider: local_csv       # ← change this: local_csv | bigquery | gcs_parquet
 ```
 
 ### `local_csv` — local file (development / fallback)
@@ -142,9 +168,38 @@ storage:
 - `audit_table`: if present, the post-publish audit write inserts one row per changed cell (`row_id, column, old_value, new_value, timestamp, user, last_updated_at, last_updated_by`). Create the table with those STRING columns. If the audit insert fails the publish still stands; the app shows a non-blocking warning. Omit the key entirely to disable the audit write.
 - Current limitation: edited values are bound as STRING parameters. If your table has typed columns (FLOAT64, etc.), add per-column `CAST`s in `providers/storage/bigquery.py` (the spot is marked at the `SET` clause builder).
 
+### `gcs_parquet` — GCS parquet file + BigQuery change log (988 GCP deployment)
+
+The dataset lives as a single parquet object on Google Cloud Storage; every publish (edit or full CSV import) also appends a structured before/after audit trail to a separate BigQuery table.
+
+```yaml
+storage:
+  provider: gcs_parquet
+  gcs_parquet:
+    bucket: collab-nprod-data
+    blob_path: collaborator_988_raw/raw_crisis_988_data/geo_coded_988_data.parquet
+    id_column: null           # null → row order is the row id
+    change_log:
+      project: collab-infra-nprod
+      dataset: collaborator_988_raw
+      table: 988_change_log
+      location: US
+```
+
+```bash
+pip install google-cloud-storage google-cloud-bigquery pyarrow
+gcloud auth application-default login   # or GOOGLE_APPLICATION_CREDENTIALS
+```
+
+- Every read/write moves through an in-memory buffer only (`blob.download_as_bytes()` / `blob.upload_from_string()`) — never a local temp file, so there's nothing left open or half-written if something fails partway through. A GCS object write is a single atomic PUT: readers never see a partial object.
+- `change_log` is **required** — the table must already exist with the dataset's 17 data columns plus `change_id`, `change_state` (`before`/`after`), `change_type` (`insert`/`update`/`delete`), `changed_by`, `changed_at`. See the README's "Audit / change log" section for exactly how rows are built.
+- **Write order is audit-first**, unlike `local_csv`/`bigquery` above: the change-log write happens *before* the parquet write on every publish. If the parquet write then fails, the app surfaces a distinct blocking error rather than silently leaving the data unwritten while the log says otherwise — see the README for why this ordering was chosen.
+- Supports the app's CSV **Import** feature (`supports_import = True`): an imported file fully replaces the parquet object; every row is logged as a fresh `insert`.
+- **Known limitation**: publishing rewrites the entire parquet object from an in-memory DataFrame, so two concurrent editors can clobber each other's *unrelated* changes (a bigger blast radius than `bigquery`'s targeted per-cell `MERGE` above). Not hardened in this version — a future enhancement would use GCS generation preconditions (`if_generation_match`) to fail loudly instead of clobbering.
+
 ### Adding a new storage provider (e.g. Postgres, S3)
 
-Same pattern as auth: subclass `StorageProvider` (`providers/storage/base.py` documents the contract — `load()` returns a DataFrame indexed by a stable unique row id; `apply_edits()` persists `{(row_id, column): value}`; `write_audit()` is optional), register it in `providers/storage/__init__.py`, add a settings block, point `storage.provider` at it.
+Same pattern as auth: subclass `StorageProvider` (`providers/storage/base.py` documents the contract — `load()` returns a DataFrame indexed by a stable unique row id; `apply_edits()` persists `{(row_id, column): value}`; `write_audit()` and `replace_all()` are optional, as are the `audit_before_data_write`/`supports_import` class attributes that control ordering and gate the Import feature), register it in `providers/storage/__init__.py`, add a settings block, point `storage.provider` at it.
 
 ---
 

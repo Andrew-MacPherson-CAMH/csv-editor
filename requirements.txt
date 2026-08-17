@@ -1,8 +1,16 @@
 streamlit>=1.48
 pandas>=2.0
 PyYAML>=6.0
-requests>=2.31            # gcloud_identity auth provider
+requests>=2.31            # gcloud_identity + google_oauth auth providers
 
-# Optional — only needed when storage.provider = bigquery
+# Optional — needed when storage.provider = bigquery OR gcs_parquet
+# (gcs_parquet's change-log audit trail is a BigQuery table either way)
 # google-cloud-bigquery>=3.20
 # db-dtypes>=1.2
+
+# Optional — only needed when storage.provider = gcs_parquet
+# google-cloud-storage>=2.16
+# pyarrow>=15.0
+
+# Optional — only needed when auth.provider = google_oauth
+# google-auth>=2.30

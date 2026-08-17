@@ -20,16 +20,24 @@ from __future__ import annotations
 
 import html
 import json
+import secrets
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import pandas as pd
 import streamlit as st
 
-
+from core.audit import rows_for_edits, rows_for_full_replace
 from core.config import AppConfig, ColumnRule, load_config
-from datetime import datetime, timezone
-from core.validation import (ERROR, WARNING, errors_only, normalize_value,
-                             validate_edits, warnings_only)
+from core.csv_import import extra_columns, missing_columns, validate_dataframe
+from core.oauth_flow import OAuthCallbackKind, interpret_callback
+from core.publish import publish_with_audit
+from core.validation import (
+    errors_only,
+    normalize_value,
+    validate_edits,
+    warnings_only,
+)
 from providers.auth import AuthError, create_auth_provider
 from providers.storage import ROW_ID, StorageError, create_storage_provider
 
@@ -74,12 +82,16 @@ def init_state() -> None:
     ss.setdefault("user", None)
     ss.setdefault("original_df", None)   # DataFrame indexed by ROW_ID
     ss.setdefault("edits", {})           # {(row_id, column): new_value}
-    ss.setdefault("view", "editing")     # editing | review
+    ss.setdefault("view", "editing")     # editing | review | import_upload | import_review
     ss.setdefault("grid_ver", 0)         # bump to rotate the grid widget key
     ss.setdefault("undo_stack", [])      # instruction objects, see undo/redo below
     ss.setdefault("redo_stack", [])
     ss.setdefault("just_published", None)
     ss.setdefault("audit_warning", None)
+    ss.setdefault("import_df", None)     # DataFrame from an uploaded CSV, pre-publish
+    ss.setdefault("import_edits", {})    # {(row_id, column): new_value}, import-review only
+    ss.setdefault("export_ready", None)  # (csv_bytes, filename) once Export data has run
+    ss.setdefault("export_error", None)
 
 
 def bump_grid() -> None:
@@ -100,12 +112,16 @@ def rules_by_column() -> dict[str, ColumnRule]:
     return {r.name: r for r in get_config().columns}
 
 
-def df_with_edits(df: pd.DataFrame) -> pd.DataFrame:
+def merge_edits(df: pd.DataFrame, edits: dict[tuple, str]) -> pd.DataFrame:
     out = df.copy()
-    for (row_id, column), value in st.session_state.edits.items():
+    for (row_id, column), value in edits.items():
         if row_id in out.index and column in out.columns:
             out.at[row_id, column] = "" if value is None else str(value)
     return out
+
+
+def df_with_edits(df: pd.DataFrame) -> pd.DataFrame:
+    return merge_edits(df, st.session_state.edits)
 
 
 def set_edit(row_id: Any, column: str, new_value: str) -> None:
@@ -282,21 +298,33 @@ def inject_css() -> None:
 # ------------------------------------------------------------- login (1a)
 
 
+def _login_header(cfg: AppConfig) -> None:
+    st.markdown(
+        f"""
+        <div style="max-width:420px;margin:48px auto 12px;text-align:center;">
+          <div style="width:56px;height:56px;border-radius:50%;background:{GREEN};margin:0 auto 14px;
+                      display:flex;align-items:center;justify-content:center;color:#fff;font-weight:600;">DE</div>
+          <div style="font-size:22px;font-weight:600;">{esc(cfg.title)}</div>
+          <div class="de-note">{esc(cfg.subtitle)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_login() -> None:
+    provider = get_auth_provider()
+    if provider.redirect_based:
+        render_oauth_login(provider)
+    else:
+        render_credential_login()
+
+
+def render_credential_login() -> None:
     cfg = get_config()
     _, mid, _ = st.columns([1, 1.05, 1])
     with mid:
-        st.markdown(
-            f"""
-            <div style="max-width:420px;margin:48px auto 12px;text-align:center;">
-              <div style="width:56px;height:56px;border-radius:50%;background:{GREEN};margin:0 auto 14px;
-                          display:flex;align-items:center;justify-content:center;color:#fff;font-weight:600;">DE</div>
-              <div style="font-size:22px;font-weight:600;">{esc(cfg.title)}</div>
-              <div class="de-note">{esc(cfg.subtitle)}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        _login_header(cfg)
         with st.form("login"):
             username = st.text_input("Email", key="login_email")
             password = st.text_input("Password", type="password", key="login_password")
@@ -322,13 +350,82 @@ def render_login() -> None:
                 st.rerun()
 
 
+def render_oauth_login(provider) -> None:
+    """Google's full authorization-code flow, run by this app itself (not
+    an external proxy). Every rerun re-evaluates the current query params —
+    there's no server-side "callback route", the redirect-back is just
+    another top-to-bottom script run that happens to have ?code&state set.
+    """
+    cfg = get_config()
+    ss = st.session_state
+    result = interpret_callback(dict(st.query_params), ss.get("oauth_state"))
+
+    if result.kind == OAuthCallbackKind.EXCHANGE:
+        # Clear query params before anything else: leaving a spent ?code in
+        # the URL would silently replay it through complete_login() on the
+        # next script load (e.g. logging out and back in) with no user
+        # action, producing a confusing error on a fresh login screen.
+        code = result.code
+        st.query_params.clear()
+        ss.oauth_state = None
+        try:
+            user = provider.complete_login(code)
+        except AuthError as exc:
+            st.error(f"Sign-in is unavailable: {exc}")
+        else:
+            if user is None:
+                st.error("Google sign-in was rejected. Please try again.")
+            else:
+                ss.user = user
+                st.rerun()
+    elif result.kind == OAuthCallbackKind.DENIED:
+        st.query_params.clear()
+        ss.oauth_state = None
+        st.error(f"Google sign-in was cancelled or denied ({result.error}).")
+    elif result.kind == OAuthCallbackKind.CSRF_MISMATCH:
+        st.query_params.clear()
+        ss.oauth_state = None
+        st.error("Your sign-in session expired. Please try again.")
+
+    _, mid, _ = st.columns([1, 1.05, 1])
+    with mid:
+        _login_header(cfg)
+        ss.setdefault("oauth_state", secrets.token_urlsafe(24))
+        try:
+            login_url = provider.get_login_url(ss.oauth_state)
+        except AuthError as exc:
+            st.error(f"Sign-in is unavailable: {exc}")
+            return
+        st.link_button("Log in with Google", login_url, type="primary", width="stretch")
+
+
 # --------------------------------------------------------------- toolbar
+
+
+@st.dialog("Discard unpublished edits?")
+def confirm_discard_and_import(n_edits: int) -> None:
+    st.markdown(
+        f"You have **{n_edits} unpublished edit{'s' if n_edits != 1 else ''}**. "
+        "Importing a new file will discard them — this can't be undone."
+    )
+    c1, c2 = st.columns(2)
+    if c1.button("Cancel", width="stretch"):
+        st.rerun()
+    if c2.button("Discard and import", type="primary", width="stretch"):
+        st.session_state.edits = {}
+        st.session_state.undo_stack, st.session_state.redo_stack = [], []
+        st.session_state.view = "import_upload"
+        bump_grid()
+        st.rerun()
 
 
 def render_toolbar(subtitle: str) -> None:
     cfg = get_config()
     user = st.session_state.user
-    c_title, c_search, c_review, c_avatar = st.columns([3.0, 2.6, 1.7, 0.55])
+    provider = get_storage_provider()
+    c_title, c_search, c_export, c_import, c_review, c_avatar = st.columns(
+        [2.1, 1.9, 1.05, 1.15, 1.6, 0.55]
+    )
     with c_title:
         st.markdown(
             f'<div style="padding-top:6px;"><span class="de-title">{esc(cfg.title)}</span>'
@@ -343,6 +440,31 @@ def render_toolbar(subtitle: str) -> None:
             label_visibility="collapsed",
             on_change=bump_grid,
         )
+    with c_export:
+        if st.button("Export data", width="stretch",
+                      help="Download the latest published data as CSV"):
+            try:
+                fresh = provider.load()
+            except StorageError as exc:
+                st.session_state.export_ready = None
+                st.session_state.export_error = str(exc)
+            else:
+                cols = [c.name for c in cfg.columns]
+                csv_bytes = fresh.reindex(columns=cols).to_csv(index=False).encode("utf-8")
+                ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                st.session_state.export_ready = (csv_bytes, f"988-Export-{ts}.csv")
+                st.session_state.export_error = None
+    with c_import:
+        if st.button(
+            "Import Data", width="stretch", disabled=not provider.supports_import,
+            help=None if provider.supports_import
+            else "This storage backend doesn't support importing a full dataset",
+        ):
+            if st.session_state.edits:
+                confirm_discard_and_import(len(st.session_state.edits))
+            else:
+                st.session_state.view = "import_upload"
+                st.rerun()
     with c_review:
         n_edits = len(st.session_state.edits)
         label = f"Review changes ({n_edits})" if n_edits else "Review changes"
@@ -361,6 +483,16 @@ def render_toolbar(subtitle: str) -> None:
                 st.session_state.undo_stack, st.session_state.redo_stack = [], []
                 st.session_state.view = "editing"
                 st.rerun()
+
+    if st.session_state.export_error:
+        st.error(st.session_state.export_error)
+        st.session_state.export_error = None
+    if st.session_state.export_ready:
+        data, filename = st.session_state.export_ready
+        st.download_button(
+            f"⬇ Download {filename}", data=data, file_name=filename, mime="text/csv",
+            key="export_download",
+        )
 
 
 # ------------------------------------------------------- grid helpers
@@ -452,6 +584,12 @@ def render_cell_bridge() -> None:
 
 
 def apply_bridge_edit() -> None:
+    """Commit one cell edit from the JS overlay bridge. `page` routes the
+    edit to the right target: "editing"/"review" both patch the normal
+    edits dict (undo/redo tracked); "import" patches import_edits instead
+    (no undo/redo — the import-review page is for fixing typos before a
+    one-shot publish, not an extended editing session).
+    """
     ss = st.session_state
     raw = ss.get("cell_bridge") or ""
     if not raw:
@@ -470,8 +608,23 @@ def apply_bridge_edit() -> None:
     rule = rules_by_column().get(column)
     if rule is None or not rule.editable:
         return
-    original = ss.original_df
     new = normalize_value(value, rule)
+
+    if page == "import":
+        if ss.import_df is None or column not in ss.import_df.columns:
+            return
+        original_value = str(ss.import_df.at[row_id, column])
+        current = ss.import_edits.get((row_id, column), original_value)
+        if new == str(current):
+            return
+        if new == original_value:
+            ss.import_edits.pop((row_id, column), None)
+        else:
+            ss.import_edits[(row_id, column)] = new
+        bump_grid()
+        return
+
+    original = ss.original_df
     current = ss.edits.get((row_id, column), str(original.at[row_id, column]))
     if new == str(current):
         return
@@ -931,35 +1084,22 @@ def publish_dialog(n_rows: int, n_cells: int) -> None:
     if c1.button("Cancel", width="stretch"):
         st.rerun()
     if c2.button("Yes, publish", type="primary", width="stretch"):
+        provider = get_storage_provider()
         edits = dict(st.session_state.edits)
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        audit_records = [
-            {
-                "row_id": str(row_id),
-                "column": column,
-                "old_value": str(st.session_state.original_df.at[row_id, column]),
-                "new_value": str(value),
-                "timestamp": now,
-                "user": user.username,
-            }
-            for (row_id, column), value in edits.items()
-        ]
-        try:
-            get_storage_provider().apply_edits(st.session_state.original_df, edits)
-        except StorageError as exc:
-            st.error(f"Publish failed — no changes were saved: {exc}")
+        data_columns = [c.name for c in cfg.columns]
+        audit_records = rows_for_edits(
+            st.session_state.original_df, edits, data_columns, user.username, now
+        )
+        outcome = publish_with_audit(
+            provider,
+            lambda: provider.apply_edits(st.session_state.original_df, edits),
+            metadata={"last_updated_at": now, "last_updated_by": user.username},
+            audit_records=audit_records,
+        )
+        if not outcome.ok:
+            st.error(outcome.blocking_error)
             return
-        # Second request: metadata/audit. The CSV publish stands even if
-        # this fails — surface a non-blocking warning instead.
-        try:
-            get_storage_provider().write_audit(
-                {"last_updated_at": now, "last_updated_by": user.username},
-                audit_records,
-            )
-        except Exception as exc:
-            st.session_state.audit_warning = (
-                f"Changes were published, but the audit/metadata write failed: {exc}"
-            )
         st.session_state.original_df = df_with_edits(st.session_state.original_df)
         st.session_state.edits = {}
         st.session_state.undo_stack, st.session_state.redo_stack = [], []
@@ -968,6 +1108,176 @@ def publish_dialog(n_rows: int, n_cells: int) -> None:
             f"Published {n_cells} cell{'s' if n_cells != 1 else ''} across "
             f"{n_rows} row{'s' if n_rows != 1 else ''}."
         )
+        if outcome.audit_warning:
+            st.session_state.audit_warning = outcome.audit_warning
+        bump_grid()
+        st.rerun()
+
+
+# --------------------------------------------------------------- import
+
+
+def render_import_upload() -> None:
+    cfg = get_config()
+    provider = get_storage_provider()
+    if not provider.supports_import:
+        st.error("This storage backend doesn't support importing a full dataset.")
+        if st.button("Back to editor"):
+            st.session_state.view = "editing"
+            st.rerun()
+        return
+
+    st.markdown(
+        f'<div style="padding-top:6px;"><span class="de-title">Import data</span>'
+        f'&nbsp;&nbsp;<span class="de-fileinfo">Upload a CSV to fully replace '
+        f'{esc(cfg.dataset_display_name)}</span></div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="de-note" style="margin:4px 0 12px;">The uploaded file must have exactly '
+        "the same columns as the current dataset. Every row in it will be validated, and the "
+        "whole file replaces what's published today.</div>",
+        unsafe_allow_html=True,
+    )
+    uploaded = st.file_uploader("Choose a CSV file", type=["csv"], key="import_uploader")
+
+    c1, c2 = st.columns([1, 5])
+    if c1.button("Cancel", width="stretch"):
+        st.session_state.view = "editing"
+        st.rerun()
+    validate = c2.button(
+        "Validate & Continue", type="primary", width="stretch", disabled=uploaded is None
+    )
+
+    if not validate or uploaded is None:
+        return
+
+    try:
+        raw_df = pd.read_csv(uploaded, dtype=str, keep_default_na=False)
+    except Exception as exc:
+        st.error(f"Could not read that file as a CSV: {exc}")
+        return
+
+    expected = [c.name for c in cfg.columns]
+    got = list(raw_df.columns)
+    missing = missing_columns(got, expected)
+    extra = extra_columns(got, expected)
+    if missing:
+        st.error("Missing required column(s): " + ", ".join(missing))
+    if extra:
+        st.error("Unexpected column(s) not in the schema: " + ", ".join(extra))
+    if missing or extra:
+        return
+
+    import_df = raw_df.reindex(columns=expected)
+    import_df.index = pd.RangeIndex(len(import_df), name=ROW_ID)
+    st.session_state.import_df = import_df
+    st.session_state.import_edits = {}
+    st.session_state.view = "import_review"
+    bump_grid()
+    st.rerun()
+
+
+def render_import_review() -> None:
+    cfg = get_config()
+    rules = rules_by_column()
+    if st.session_state.import_df is None:
+        st.session_state.view = "import_upload"
+        st.rerun()
+        return
+
+    display_df = merge_edits(st.session_state.import_df, st.session_state.import_edits)
+    findings = validate_dataframe(display_df, rules)
+    errors = errors_only(findings)
+    warnings = warnings_only(findings)
+    n_rows = len(display_df)
+
+    c_title, c_discard, c_publish = st.columns([4, 1.6, 1.8])
+    with c_title:
+        if errors:
+            summary = (
+                f'<span class="de-summary-err">{len(errors)} '
+                f'cell{"s" if len(errors) != 1 else ""} invalid</span>'
+            )
+        else:
+            summary = f'{n_rows:,} row{"s" if n_rows != 1 else ""} ready to import'
+        if warnings:
+            summary += (
+                f' <span style="color:#b45309;">· {len(warnings)} required '
+                f'cell{"s" if len(warnings) != 1 else ""} blank</span>'
+            )
+        st.markdown(
+            f'<div style="padding-top:6px;"><span class="de-title">Review import</span>'
+            f'&nbsp;&nbsp;<span class="de-fileinfo">{summary}</span></div>',
+            unsafe_allow_html=True,
+        )
+    with c_discard:
+        if st.button("Discard import", width="stretch"):
+            st.session_state.import_df = None
+            st.session_state.import_edits = {}
+            st.session_state.view = "editing"
+            st.rerun()
+    with c_publish:
+        if st.button(
+            "Publish Changes", type="primary", width="stretch",
+            disabled=bool(errors),
+            help="Fix invalid cells to enable publishing" if errors else None,
+        ):
+            import_publish_dialog(display_df)
+
+    row_ids = list(display_df.index)
+    st.session_state["_row_ids_import"] = row_ids
+    render_cell_bridge()
+    render_html_grid(
+        display_df, display_df, row_ids, cfg.columns, st.session_state.import_edits,
+        errors, warnings, "", page="import", max_height=560,
+    )
+    render_grid_script(autosize=True)
+
+
+@st.dialog("Publish imported data?")
+def import_publish_dialog(final_df: pd.DataFrame) -> None:
+    cfg = get_config()
+    user = st.session_state.user
+    n_rows = len(final_df)
+    st.markdown(
+        f"You're about to **replace the entire dataset** with **{n_rows:,} "
+        f"row{'s' if n_rows != 1 else ''}** from the imported file, in "
+        f"**{cfg.dataset_display_name}**. This can't be undone."
+    )
+    st.markdown(
+        f'<div class="de-note">saved as {esc(user.username)} · every row is logged as a new '
+        "insert in the change log</div>",
+        unsafe_allow_html=True,
+    )
+    c1, c2 = st.columns(2)
+    if c1.button("Cancel", width="stretch"):
+        st.rerun()
+    if c2.button("Yes, publish", type="primary", width="stretch"):
+        provider = get_storage_provider()
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        data_columns = [c.name for c in cfg.columns]
+        audit_records = rows_for_full_replace(final_df, data_columns, user.username, now)
+        outcome = publish_with_audit(
+            provider,
+            lambda: provider.replace_all(final_df),
+            metadata={},
+            audit_records=audit_records,
+        )
+        if not outcome.ok:
+            st.error(outcome.blocking_error)
+            return
+        st.session_state.original_df = final_df
+        st.session_state.import_df = None
+        st.session_state.import_edits = {}
+        st.session_state.edits = {}
+        st.session_state.undo_stack, st.session_state.redo_stack = [], []
+        st.session_state.view = "editing"
+        st.session_state.just_published = (
+            f"Imported and published {n_rows:,} row{'s' if n_rows != 1 else ''}."
+        )
+        if outcome.audit_warning:
+            st.session_state.audit_warning = outcome.audit_warning
         bump_grid()
         st.rerun()
 
@@ -984,8 +1294,13 @@ def main() -> None:
         return
 
     try:
-        if st.session_state.view == "review":
+        view = st.session_state.view
+        if view == "review":
             render_review()
+        elif view == "import_upload":
+            render_import_upload()
+        elif view == "import_review":
+            render_import_review()
         else:
             render_editing()
     except StorageError as exc:

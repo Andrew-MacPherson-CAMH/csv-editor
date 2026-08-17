@@ -11,8 +11,13 @@ app:
   subtitle: "sign in to edit the dataset"
 
 # ------------------------------------------------------------
-# AUTH — pick one: mock | gcloud_identity
+# AUTH — pick one: mock | gcloud_identity | google_oauth
 # (register more in providers/auth/__init__.py)
+#
+# For the 988 GCP deployment: set provider: google_oauth below (or point
+# CSV_EDITOR_CONFIG at a separate deployment config file that does) — kept
+# as mock here so `streamlit run app.py` and the test suite work with zero
+# GCP setup. See README.md's "GCP deployment" section.
 # ------------------------------------------------------------
 auth:
   provider: mock
@@ -31,9 +36,25 @@ auth:
     api_key_env: GCP_IDENTITY_API_KEY
     # api_key: "..."           # inline fallback (avoid committing)
 
+  google_oauth:
+    # Full OAuth authorization-code flow, run by this app itself.
+    # https://developers.google.com/identity/protocols/oauth2/web-server
+    client_id_env: GOOGLE_OAUTH_CLIENT_ID
+    client_secret_env: GOOGLE_OAUTH_CLIENT_SECRET
+    # client_id / client_secret: "..."   # inline fallback (avoid committing)
+    redirect_uri: https://<your-cloud-run-service>/   # must exactly match the
+                                                        # OAuth client's authorized
+                                                        # redirect URI in Google
+                                                        # Cloud Console
+
 # ------------------------------------------------------------
-# STORAGE — pick one: local_csv | bigquery
+# STORAGE — pick one: local_csv | bigquery | gcs_parquet
 # (register more in providers/storage/__init__.py)
+#
+# For the 988 GCP deployment: set provider: gcs_parquet below (or point
+# CSV_EDITOR_CONFIG at a separate deployment config file that does) — kept
+# as local_csv here so `streamlit run app.py` and the test suite work with
+# zero GCP setup. See README.md's "GCP deployment" section.
 # ------------------------------------------------------------
 storage:
   provider: local_csv
@@ -55,6 +76,22 @@ storage:
     #   gcloud auth application-default login
     # or GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa.json
     location: US
+
+  gcs_parquet:
+    # A single parquet object on GCS — read/written in-memory, no local
+    # temp files (see providers/storage/gcs_parquet.py).
+    bucket: collab-nprod-data
+    blob_path: collaborator_988_raw/raw_crisis_988_data/geo_coded_988_data.parquet
+    id_column: null           # null → use file row order as the row id
+    # Change-log audit trail (BigQuery). Same 17 columns as the dataset,
+    # plus change_id/change_state/change_type/changed_by/changed_at — see
+    # core/audit.py. Written BEFORE the parquet write on every publish.
+    change_log:
+      project: collab-infra-nprod
+      dataset: collaborator_988_raw
+      table: 988_change_log
+      location: US
+    # Auth uses Application Default Credentials, same as bigquery above.
 
 # ------------------------------------------------------------
 # DATASET — display name + column definitions.

@@ -35,6 +35,19 @@ class StorageError(Exception):
 class StorageProvider(ABC):
     name: str = "base"
 
+    # True => the app calls write_audit() BEFORE the data write, and a failed
+    # data write after a successful audit write is surfaced as a distinct,
+    # blocking error (an audit trail slightly ahead of reality is the safer
+    # failure mode for a compliance log than data changing with no record of
+    # it at all). False (default) preserves the existing behavior: data write
+    # first, a failed write_audit() is only a non-blocking warning.
+    audit_before_data_write: bool = False
+
+    # True => this provider implements replace_all() for bulk dataset
+    # replacement (e.g. CSV import). Lets the UI gate the Import feature
+    # generically instead of catching NotImplementedError at click time.
+    supports_import: bool = False
+
     def __init__(self, settings: dict[str, Any]):
         self.settings = settings
 
@@ -52,18 +65,33 @@ class StorageProvider(ABC):
         """
         raise NotImplementedError
 
+    def replace_all(self, new_df: pd.DataFrame) -> None:
+        """Replace the entire dataset with `new_df` (e.g. a CSV import).
+
+        Unlike apply_edits(), this isn't a patch — every row in the backend
+        is replaced by every row in `new_df`. Optional: only providers with
+        supports_import = True need to implement this.
+        """
+        raise StorageError(f"{self.name} does not support replacing the whole dataset")
+
     def write_audit(
         self, metadata: dict[str, Any], records: list[dict[str, Any]]
     ) -> None:
-        """Optional second write, issued AFTER a successful publish.
+        """Optional audit write. Ordering relative to the data write is
+        controlled by `audit_before_data_write` (see above), not by this
+        method — implementations just persist whatever `records` they're
+        given.
 
         `metadata`: {"last_updated_at": iso-timestamp, "last_updated_by": email}
-        `records`:  one dict per changed cell:
-                    {row_id, column, old_value, new_value, timestamp, user}
+        `records`:  a list of caller-defined row dicts — this base class
+                    does not prescribe their shape (existing implementations
+                    treat it as an opaque passthrough), so callers are free
+                    to pass per-cell diffs, full before/after row snapshots,
+                    or anything else a given deployment's audit store needs.
 
-        The CSV publish stands even if this fails — the app surfaces a
-        non-blocking warning. Default: no-op for backends without an
-        audit store.
+        A failing write_audit() is non-blocking (see audit_before_data_write
+        for the exception). Default: no-op for backends without an audit
+        store.
         """
 
     def display_name(self) -> str:

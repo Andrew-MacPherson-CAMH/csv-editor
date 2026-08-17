@@ -1,0 +1,9 @@
+[tool.ruff]
+line-length = 110
+
+[tool.ruff.lint]
+# Conservative on purpose: real bugs (pyflakes), syntax errors, the "safe"
+# pycodestyle subset, and import order -- not style/modernization opinions
+# (pyupgrade, flake8-bugbear, etc.), which would surface a lot of unrelated
+# noise on first adoption. Widen this over time if useful.
+select = ["E4", "E7", "E9", "F", "I"]
