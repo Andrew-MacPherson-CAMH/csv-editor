@@ -270,10 +270,37 @@ def _login_header(cfg: AppConfig) -> None:
 
 def render_login() -> None:
     provider = get_auth_provider()
-    if provider.redirect_based:
+    if provider.header_based:
+        render_iap_login(provider)
+    elif provider.redirect_based:
         render_oauth_login(provider)
     else:
         render_credential_login()
+
+
+def render_iap_login(provider) -> None:
+    cfg = get_config()
+    try:
+        user = provider.authenticate_from_headers(st.context.headers)
+    except AuthError as exc:
+        _, mid, _ = st.columns([1, 1.05, 1])
+        with mid:
+            _login_header(cfg)
+            st.error(f"Sign-in is unavailable: {exc}")
+        return
+
+    if user is None:
+        _, mid, _ = st.columns([1, 1.05, 1])
+        with mid:
+            _login_header(cfg)
+            st.error(
+                "No verified identity was found on this request. This app "
+                "must be accessed through its Identity-Aware Proxy URL."
+            )
+        return
+
+    st.session_state.user = user
+    st.rerun()
 
 
 def render_credential_login() -> None:
@@ -420,7 +447,9 @@ def render_toolbar(subtitle: str) -> None:
     with c_avatar:
         with st.popover(user.initials, help=user.display_name):
             st.markdown(f"**{esc(user.display_name)}**", unsafe_allow_html=True)
-            if st.button("Log out", width="stretch"):
+            if not get_auth_provider().header_based and st.button(
+                "Log out", width="stretch"
+            ):
                 st.session_state.user = None
                 st.session_state.original_df = None
                 st.session_state.edits = {}

@@ -11,22 +11,23 @@ app:
   subtitle: "sign in to edit the dataset"
 
 # ------------------------------------------------------------
-# AUTH — pick one: mock | gcloud_identity | google_oauth
+# AUTH — pick one: iap | gcloud_identity | google_oauth
 # (register more in providers/auth/__init__.py)
 #
-# For the 988 GCP deployment: set provider: google_oauth below (or point
-# CSV_EDITOR_CONFIG at a separate deployment config file that does) — kept
-# as mock here so `streamlit run app.py` and the test suite work with zero
-# GCP setup. See README.md's "GCP deployment" section.
+# Default is iap: the app trusts Google Cloud Identity-Aware Proxy and
+# expects to be deployed behind it (Cloud Run, App Engine, or GCE/GKE with
+# an IAP-protected backend). See README.md's "GCP deployment" section.
 # ------------------------------------------------------------
 auth:
-  provider: mock
+  provider: iap
 
-  mock:
-    # Dev-only users. NEVER use in production.
-    users:
-      admin: "admin"
-      editor: "editor"
+  iap:
+    # Audience the IAP-signed identity token must match.
+    #   External HTTPS load balancer: /projects/PROJECT_NUMBER/global/backendServices/SERVICE_ID
+    #   App Engine:                   /projects/PROJECT_NUMBER/apps/PROJECT_ID
+    # https://cloud.google.com/iap/docs/signed-headers-howto
+    audience_env: IAP_AUDIENCE
+    # audience: "..."           # inline fallback (avoid committing)
 
   gcloud_identity:
     # Google Cloud Identity Platform (email+password sign-in).
@@ -51,13 +52,14 @@ auth:
 # STORAGE — pick one: local_csv | bigquery | gcs_parquet
 # (register more in providers/storage/__init__.py)
 #
-# For the 988 GCP deployment: set provider: gcs_parquet below (or point
-# CSV_EDITOR_CONFIG at a separate deployment config file that does) — kept
-# as local_csv here so `streamlit run app.py` and the test suite work with
-# zero GCP setup. See README.md's "GCP deployment" section.
+# Default is gcs_parquet for the 988 GCP deployment. local_csv is kept
+# below, pointed at sample_data/resources.csv, purely as a zero-setup local
+# dev fallback — set CSV_EDITOR_CONFIG to a separate config file (or edit
+# provider: below) to use it locally. See README.md's "GCP deployment"
+# section.
 # ------------------------------------------------------------
 storage:
-  provider: local_csv
+  provider: gcs_parquet
 
   local_csv:
     path: sample_data/resources.csv

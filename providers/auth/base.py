@@ -30,6 +30,7 @@ class AuthProvider(ABC):
 
     name: str = "base"
     redirect_based: bool = False
+    header_based: bool = False
 
     def __init__(self, settings: dict[str, Any]):
         self.settings = settings
@@ -42,4 +43,7 @@ class AuthProvider(ABC):
         raise NotImplementedError
 
     def complete_login(self, code: str) -> Optional[User]:
+        raise NotImplementedError
+
+    def authenticate_from_headers(self, headers: Any) -> Optional[User]:
         raise NotImplementedError

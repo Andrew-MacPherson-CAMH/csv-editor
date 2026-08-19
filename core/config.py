@@ -62,7 +62,7 @@ class AppConfig:
 
     @property
     def auth_provider_name(self) -> str:
-        return self.raw.get("auth", {}).get("provider", "mock")
+        return self.raw.get("auth", {}).get("provider", "iap")
 
     def auth_settings(self, name: Optional[str] = None) -> dict[str, Any]:
         name = name or self.auth_provider_name

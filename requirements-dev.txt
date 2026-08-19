@@ -1,5 +1,4 @@
 -r requirements.txt
 
-pytest>=8.0        # test runner (tests/ has no other declared dependency on it)
 ruff>=0.16         # linter — see pyproject.toml's [tool.ruff] for the rule set
 pre-commit>=4.0    # runs the hooks in .pre-commit-config.yaml

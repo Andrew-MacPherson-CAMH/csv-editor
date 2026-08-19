@@ -2,10 +2,9 @@
 
 Streamlit implementation of the IYS "Data Editor" wireframes: authenticated users edit cells of a tabular dataset in a grid, filter rows with live search, review pending changes with per-cell validation, and publish behind a confirmation dialog. Data can also be exported as a CSV snapshot or bulk-replaced by importing one.
 
-Auth and storage are **pluggable providers selected in `config.yaml`** (see **[CONFIG.md](CONFIG.md)** for the full guide) — swap Google OAuth or a GCS/BigQuery-backed dataset for something else without touching application code. This repo ships two deployment shapes:
+Auth and storage are **pluggable providers selected in `config.yaml`** (see **[CONFIG.md](CONFIG.md)** for the full guide) — swap the auth or storage backend for something else without touching application code. `config.yaml` ships configured for the **988 GCP deployment**: `iap` auth (the app trusts Google Cloud Identity-Aware Proxy) + `gcs_parquet` storage (a parquet file on GCS, with a structured audit trail in BigQuery). See "GCP deployment" below.
 
-- **Zero-setup local dev** (the shipped default): `mock` auth + `local_csv` storage, backed by `sample_data/resources.csv`.
-- **988 GCP deployment**: `google_oauth` auth + `gcs_parquet` storage (a parquet file on GCS, with a structured audit trail in BigQuery). See "GCP deployment" below.
+`gcloud_identity` and `google_oauth` (email/password or app-run OAuth) remain available for deployments not fronted by IAP, and `local_csv` remains available as a local-dev storage fallback (backed by `sample_data/resources.csv`) — point `CSV_EDITOR_CONFIG` at a separate config file to use them without touching the shipped `config.yaml`. See [CONFIG.md](CONFIG.md) for every provider's settings.
 
 ## Quick start
 
@@ -14,15 +13,13 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Log in with `admin` / `admin` (the dev `mock` auth provider). The default storage provider is `local_csv` backed by `sample_data/resources.csv` (96 sample crisis-line / community-resource rows, including required-blank cells to exercise the amber warnings), so the app runs end-to-end with no cloud setup at all.
-
-**`config.yaml` ships with `auth.provider: mock` and `storage.provider: local_csv` on purpose**, even though this repo also contains the GCP-ready `google_oauth`/`gcs_parquet` providers — flipping those on requires real Google Cloud credentials and a live bucket/table, which would break `streamlit run app.py` (and the test suite) for anyone without that access. For the real 988 deployment, either edit `config.yaml`'s two `provider:` lines directly, or point `CSV_EDITOR_CONFIG` at a separate deployment-specific config file.
+The shipped `config.yaml` uses `iap` auth, so running locally requires either deploying behind Identity-Aware Proxy or pointing `CSV_EDITOR_CONFIG` at a config file with `auth.provider: gcloud_identity` (or `google_oauth`) for a local login screen. See [CONFIG.md](CONFIG.md#2-auth--authentication) for each provider's setup.
 
 ## Screens → wireframes
 
 | Wireframe | Where |
 |---|---|
-| 1a Login | centered card, logo mark, email/password (`mock`/`gcloud_identity`) or a "Log in with Google" button (`google_oauth`) |
+| 1a Login | `iap` skips this screen entirely (identity comes from the proxy); otherwise a centered card, logo mark, email/password (`gcloud_identity`) or a "Log in with Google" button (`google_oauth`) |
 | 1b Editing | toolbar (title, file info, search, Export Data, Import Data, "Review changes (n)" badge, avatar), grid |
 | 2a Search | as-you-type filtering, blue filter bar (`Showing x of n rows matching "…"`), Clear search, yellow match highlighting; **edits on hidden rows are kept and the badge count is unchanged** |
 | 1c Review | only edited rows, green-tinted changed cells showing `old → new`, cells still editable, summary "n rows · m cells changed", plus a diff panel with struck-through old values |
@@ -54,29 +51,19 @@ core/
   publish.py                shared publish helper (audit/data write ordering)
 providers/
   auth/
-    base.py                 AuthProvider ABC + User (credential form OR redirect-based)
-    mock.py                 dev users from config
+    base.py                 AuthProvider ABC + User (credential form, redirect-based, OR header-based)
+    iap.py                   Google Cloud Identity-Aware Proxy (trusts the signed request header)
     gcloud_identity.py      Google Cloud Identity Platform (email+password REST)
     google_oauth.py         Google OAuth, full authorization-code flow run by this app
     __init__.py             registry + factory (lazy imports)
   storage/
     base.py                 StorageProvider ABC (load / apply_edits / replace_all / write_audit)
-    local_csv.py             local file, atomic writes
+    local_csv.py             local file, atomic writes (local-dev fallback)
     bigquery.py              BigQuery table, atomic MERGE publish
     gcs_parquet.py            GCS parquet file + BigQuery change-log audit trail
     __init__.py              registry + factory (lazy imports)
-tests/
-  test_app.py                end-to-end view tests (Streamlit AppTest)
-  test_validation.py         validation engine + audit write
-  test_audit.py, test_csv_import.py, test_oauth_flow.py, test_publish.py,
-  test_google_oauth.py, test_gcs_parquet.py, test_import_flow.py
-                              unit tests for the new modules above (see "Tests")
-  stubs/gcp_fakes.py         fake google.cloud.storage/bigquery + google.oauth2/auth,
-                              so GCP-touching code is testable with zero real credentials
 sample_data/
-  resources.csv               local-dev dataset (local_csv default)
-  dummy_988_data.csv          988-schema dummy data w/ 2 deliberately invalid rows,
-                              for exercising Import validation — removable before launch
+  resources.csv               local-dev dataset (local_csv fallback)
 ```
 
 ### State model
@@ -94,13 +81,16 @@ Everything is driven by two lines in `config.yaml`:
 
 ```yaml
 auth:
-  provider: google_oauth   # or: mock | gcloud_identity
+  provider: iap             # or: gcloud_identity | google_oauth
 storage:
-  provider: gcs_parquet    # or: local_csv | bigquery
+  provider: gcs_parquet     # or: local_csv | bigquery
 ```
 
-### Auth: Google OAuth (988 deployment)
-`google_oauth` has the app itself run the full OAuth authorization-code flow — no fronting proxy involved. See [CONFIG.md](CONFIG.md#google_oauth--google-oauth-run-by-this-app-988-gcp-deployment) for the config block and [GCP deployment](#gcp-deployment) below for consent-screen/credentials setup.
+### Auth: Identity-Aware Proxy (988 deployment default)
+`iap` trusts Google Cloud IAP: the app must be deployed behind it (Cloud Run, App Engine, or GCE/GKE with an IAP-protected backend), and every request already carries a signed identity assertion IAP verifies before the request reaches Streamlit — no login screen, no credentials handled by the app itself. See [CONFIG.md](CONFIG.md#iap--identity-aware-proxy-default) for the config block.
+
+### Auth: Google OAuth (no fronting proxy)
+`google_oauth` has the app itself run the full OAuth authorization-code flow — for deployments not fronted by IAP. See [CONFIG.md](CONFIG.md#google_oauth--google-oauth-run-by-this-app-no-fronting-proxy) for the config block and [GCP deployment](#gcp-deployment) below for consent-screen/credentials setup.
 
 ### Storage: GCS parquet + BigQuery change log (988 deployment)
 `gcs_parquet` reads/writes a single parquet object on GCS (in-memory only — never a local temp file) and logs a structured before/after trail to BigQuery on every publish. See [CONFIG.md](CONFIG.md#gcs_parquet--gcs-parquet-file--bigquery-change-log-988-gcp-deployment) for the config block.
@@ -120,7 +110,7 @@ register_storage_provider("postgres",
     lambda: _import("providers.storage.postgres", "PostgresStorageProvider"))
 ```
 
-The contract is documented in `providers/storage/base.py`: `load()` must return a DataFrame indexed by a stable unique row id; `apply_edits()` receives already-validated `{(row_id, column): value}` and should persist atomically where the backend allows; `replace_all()`/`supports_import` are optional (only needed to support the Import feature); `write_audit()`/`audit_before_data_write` are optional (only needed for an audit trail). Same pattern for auth in `providers/auth/` — `authenticate()` for a credential-form provider, or `redirect_based = True` + `get_login_url()`/`complete_login()` for a redirect-based one (see `google_oauth.py`).
+The contract is documented in `providers/storage/base.py`: `load()` must return a DataFrame indexed by a stable unique row id; `apply_edits()` receives already-validated `{(row_id, column): value}` and should persist atomically where the backend allows; `replace_all()`/`supports_import` are optional (only needed to support the Import feature); `write_audit()`/`audit_before_data_write` are optional (only needed for an audit trail). Same pattern for auth in `providers/auth/` — `authenticate()` for a credential-form provider, `redirect_based = True` + `get_login_url()`/`complete_login()` for a redirect-based one (see `google_oauth.py`), or `header_based = True` + `authenticate_from_headers()` for a proxy-trust provider (see `iap.py`).
 
 ## Columns & validation
 
@@ -155,28 +145,30 @@ Every publish (an editor cell-edit publish, or an import full-replace publish) b
 
 ## GCP deployment
 
-This section covers the `google_oauth` + `gcs_parquet` provider pair specifically.
+This section covers the default `iap` + `gcs_parquet` provider pair; see the note at the end for the `google_oauth` alternative when IAP isn't fronting the app.
 
 ### Secrets / environment variables
 
 | Variable | Used by | Purpose |
 |---|---|---|
-| `GOOGLE_OAUTH_CLIENT_ID` | `google_oauth` auth | OAuth 2.0 client ID (Google Cloud Console → Credentials) |
-| `GOOGLE_OAUTH_CLIENT_SECRET` | `google_oauth` auth | OAuth 2.0 client secret |
+| `IAP_AUDIENCE` | `iap` auth | Expected audience of the IAP-signed identity token — `/projects/PROJECT_NUMBER/global/backendServices/SERVICE_ID` (external HTTPS load balancer) or `/projects/PROJECT_NUMBER/apps/PROJECT_ID` (App Engine). See [CONFIG.md](CONFIG.md#iap--identity-aware-proxy-default). |
 | `GOOGLE_APPLICATION_CREDENTIALS` | `gcs_parquet` storage | Path to a service account key JSON — **omit this entirely** if running on GCP infrastructure that already provides Application Default Credentials (Cloud Run's attached runtime service account, GCE metadata server, etc.); only needed for local development against real GCP resources. |
 
-`config.yaml`'s `auth.google_oauth.redirect_uri` (not a secret, but deployment-specific) must exactly match an authorized redirect URI on the OAuth client.
+If using `google_oauth` instead of `iap`, `GOOGLE_OAUTH_CLIENT_ID`/`GOOGLE_OAUTH_CLIENT_SECRET` are needed too, and `config.yaml`'s `auth.google_oauth.redirect_uri` must exactly match an authorized redirect URI on the OAuth client.
 
 ### IAM roles (for the runtime service account)
 
 - **`roles/storage.objectAdmin`** scoped to the `collab-nprod-data` bucket (or a narrower `objectViewer` + `objectCreator` combo if you don't want delete permission — this app never deletes the parquet object, only overwrites it).
 - **`roles/bigquery.dataEditor`** scoped to the `collaborator_988_raw` dataset in `collab-infra-nprod`, for the `988_change_log` table. **`roles/bigquery.jobUser` is not required** for this — the change-log write is a streaming insert (`insert_rows_json` / `tabledata.insertAll`), not a query job. (This is unlike the separate, generic `bigquery` *storage* provider in this repo, which does run real queries and does need `jobUser` if you use it instead.)
 
-### OAuth consent screen
+### Enabling IAP (default: `iap` auth)
 
-1. Google Cloud Console → APIs & Services → OAuth consent screen. Choose **Internal** if every user is in your Google Workspace org, else **External**.
-2. Scopes: `openid`, `email`, `profile` only — Google's non-sensitive bucket, so no app-verification review is required even for an External screen.
-3. Credentials → Create OAuth client ID (Web application). Add the deployed app's URL as an authorized redirect URI, exactly matching `redirect_uri` in `config.yaml`.
+1. Deploy the app behind an HTTPS load balancer (Cloud Run works via a [serverless NEG](https://cloud.google.com/run/docs/mapping-custom-domains) backend) and enable IAP on that backend service under Security → Identity-Aware Proxy in the Cloud Console.
+2. Grant each user/group the **IAP-Secured Web App User** role (`roles/iap.httpsResourceAccessor`) on the backend service — this is the actual access-control gate, separate from anything in this app.
+3. Set `IAP_AUDIENCE` to that backend service's audience string (shown on the IAP console page, or via `gcloud iap web get-iam-policy`) — format `/projects/PROJECT_NUMBER/global/backendServices/SERVICE_ID`.
+4. The Cloud Run service itself must **not** be publicly invokable — grant `roles/run.invoker` only to the load balancer's service agent, not `allUsers`, so requests can't bypass IAP by hitting the Cloud Run URL directly.
+
+Full walkthrough: https://cloud.google.com/iap/docs/enabling-cloud-run
 
 ### Cloud Run deploy (example)
 
@@ -184,32 +176,24 @@ This section covers the `google_oauth` + `gcs_parquet` provider pair specificall
 gcloud run deploy 988-data-editor \
   --source . \
   --region us-central1 \
-  --allow-unauthenticated \
-  --session-affinity \
-  --set-env-vars GOOGLE_OAUTH_CLIENT_ID=...,GOOGLE_OAUTH_CLIENT_SECRET=...
+  --no-allow-unauthenticated \
+  --set-env-vars IAP_AUDIENCE=/projects/PROJECT_NUMBER/global/backendServices/SERVICE_ID
 ```
 
-**`--session-affinity` is required, not optional**, if the service can scale beyond one instance. The OAuth CSRF `state` value round-trips through `st.session_state`, which lives in-process on whichever instance handled the initial "Log in with Google" click; without session affinity, the redirect-back can land on a different instance and every login will spuriously fail the CSRF check.
+Then wire the service to an external HTTPS load balancer with IAP enabled, per the link above — `--no-allow-unauthenticated` alone doesn't set up IAP, it just ensures the Cloud Run URL can't be hit directly outside of it.
 
-Before flipping `config.yaml`'s `provider:` lines to `google_oauth`/`gcs_parquet` for a real deployment, do a one-time manual check that the real parquet file's and `988_change_log` table's column names match `config.yaml`'s 17 `name:` values exactly — a mismatch surfaces as a `StorageError` on first real read/write, not at config-load time.
+Before deploying for real, do a one-time manual check that the real parquet file's and `988_change_log` table's column names match `config.yaml`'s 17 `name:` values exactly — a mismatch surfaces as a `StorageError` on first real read/write, not at config-load time.
+
+### OAuth consent screen (only if using `google_oauth` instead of IAP)
+
+1. Google Cloud Console → APIs & Services → OAuth consent screen. Choose **Internal** if every user is in your Google Workspace org, else **External**.
+2. Scopes: `openid`, `email`, `profile` only — Google's non-sensitive bucket, so no app-verification review is required even for an External screen.
+3. Credentials → Create OAuth client ID (Web application). Add the deployed app's URL as an authorized redirect URI, exactly matching `redirect_uri` in `config.yaml`.
+4. Deploy with `--allow-unauthenticated --session-affinity`, setting `GOOGLE_OAUTH_CLIENT_ID`/`GOOGLE_OAUTH_CLIENT_SECRET` instead of `IAP_AUDIENCE`. **Session affinity is required, not optional**, if the service can scale beyond one instance — the OAuth CSRF `state` value round-trips through `st.session_state`, which lives in-process on whichever instance handled the initial "Log in with Google" click; without session affinity, the redirect-back can land on a different instance and every login will spuriously fail the CSRF check.
 
 ## Keyboard shortcuts
 
 Ctrl/Cmd+Z = undo · Ctrl/Cmd+Shift+Z or Ctrl+Y = redo (suppressed while a cell editor has focus so native text-undo still works).
-
-## Tests
-
-```bash
-python -m pytest tests/ -q
-```
-
-Every test is a unit test (or an `AppTest` run against `mock`/`local_csv` — the app's zero-setup defaults). Nothing hits real GCP, real network, or real Google OAuth:
-
-- `test_validation.py`, `test_audit.py`, `test_csv_import.py`, `test_oauth_flow.py`, `test_publish.py` — pure logic, no I/O.
-- `test_google_oauth.py`, `test_gcs_parquet.py` — exercise the real provider code against `tests/stubs/gcp_fakes.py`, which installs fake `google.cloud.storage`/`google.cloud.bigquery`/`google.oauth2.id_token`/`google.auth.transport.requests` modules (`google-cloud-storage`/`google-cloud-bigquery`/`google-auth` are optional dependencies — these tests pass with none of them installed).
-- `test_app.py`, `test_import_flow.py` — `AppTest`-driven UI flows against the real `mock`/`local_csv` providers.
-
-`sample_data/dummy_988_data.csv` (17-column schema, 2 deliberately-invalid rows) exercises the Import feature's validation surfacing in both manual testing and `test_import_flow.py` — it's dev/test fixture data, safe to delete before launch.
 
 ## Notes & known trade-offs
 - Values are edited as strings and normalized by the storage provider on publish; typed BigQuery columns need the `CAST` noted in CONFIG.md's `bigquery` section once a typed schema is in use.

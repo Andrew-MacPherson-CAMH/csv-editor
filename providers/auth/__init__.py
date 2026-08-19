@@ -6,7 +6,7 @@ from providers.auth.base import AuthError, AuthProvider
 from providers.auth.base import User as User
 
 _REGISTRY: dict[str, Callable[[], type]] = {
-    "mock": lambda: _import("providers.auth.mock", "MockAuthProvider"),
+    "iap": lambda: _import("providers.auth.iap", "IAPAuthProvider"),
     "gcloud_identity": lambda: _import(
         "providers.auth.gcloud_identity", "GcloudIdentityAuthProvider"
     ),

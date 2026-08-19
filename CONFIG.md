@@ -39,24 +39,34 @@ One line selects the provider; each provider then reads only its own settings bl
 
 ```yaml
 auth:
-  provider: mock            # ← change this: mock | gcloud_identity | google_oauth
+  provider: iap              # ← change this: iap | gcloud_identity | google_oauth
 ```
 
-### `mock` — development only
+### `iap` — Identity-Aware Proxy (default)
+
+Trusts Google Cloud IAP: the app must be deployed behind it, and every request already carries a signed identity assertion (`X-Goog-IAP-JWT-Assertion`) IAP verifies and attaches before the request reaches Streamlit. There's no login form — `authenticate_from_headers()` verifies the token's signature and audience (via `google-auth`, against Google's published JWKs) and reads the `email` claim.
 
 ```yaml
 auth:
-  provider: mock
-  mock:
-    users:                  # plain username: password pairs
-      admin: "admin"
-      editor: "editor"
-      yourname: "yourpassword"
+  provider: iap
+  iap:
+    audience_env: IAP_AUDIENCE   # name of the env var holding the audience string
+    # audience: "..."            # inline fallback — avoid committing this
 ```
 
-Add/remove users by editing the `users:` map. **Never use this in production** — passwords are plain text in the file.
+```bash
+# Windows (PowerShell)
+$env:IAP_AUDIENCE = "/projects/PROJECT_NUMBER/global/backendServices/SERVICE_ID"
+# Linux/macOS
+export IAP_AUDIENCE="/projects/PROJECT_NUMBER/global/backendServices/SERVICE_ID"
+```
 
-### `gcloud_identity` — Google Cloud Identity Platform (current production target)
+- The audience format depends on the backend: `/projects/PROJECT_NUMBER/global/backendServices/SERVICE_ID` for an external HTTPS load balancer, `/projects/PROJECT_NUMBER/apps/PROJECT_ID` for App Engine. See https://cloud.google.com/iap/docs/signed-headers-howto.
+- **This is app-level defense in depth, not the access-control gate** — the actual gate is the **IAP-Secured Web App User** IAM role (`roles/iap.httpsResourceAccessor`), granted per user/group on the backend service in the Cloud Console. The app trusts whoever IAP already let through; it doesn't manage its own user list.
+- The backend the app runs on (e.g. Cloud Run) must **not** be reachable except through the IAP-fronted load balancer, or the header can be spoofed by anyone hitting it directly. See the README's "GCP deployment" section.
+- Requires `pip install google-auth` (already in `requirements.txt`).
+
+### `gcloud_identity` — Google Cloud Identity Platform (no fronting proxy)
 
 Email + password sign-in via the Identity Toolkit REST API.
 
@@ -81,7 +91,7 @@ The API key comes from your Google Cloud project (Identity Platform → Applicat
 
 **Note:** the signed-in email is what gets written to `last_updated_by` in the audit metadata, so production should use real emails via `gcloud_identity`.
 
-### `google_oauth` — Google OAuth, run by this app (988 GCP deployment)
+### `google_oauth` — Google OAuth, run by this app (no fronting proxy)
 
 The app itself performs the full OAuth authorization-code flow: it renders a "Log in with Google" link, Google redirects the browser back with `?code&state`, and the app exchanges the code for an ID token directly. This is **not** the "trust a header from an external proxy" (IAP) pattern — there is no fronting proxy involved.
 
@@ -126,7 +136,7 @@ No config-only path — it's ~20 lines of code, then config:
 
 ```yaml
 storage:
-  provider: local_csv       # ← change this: local_csv | bigquery | gcs_parquet
+  provider: gcs_parquet      # ← change this: gcs_parquet | local_csv | bigquery
 ```
 
 ### `local_csv` — local file (development / fallback)
@@ -272,7 +282,6 @@ Each entry in `columns:` defines one column. **`type` is the single source of tr
 
 ```bash
 python -c "import sys; sys.path.insert(0,'.'); from core.config import load_config; c = load_config('config.yaml'); print(c.auth_provider_name, c.storage_provider_name, len(c.columns), 'columns')"
-python -m pytest tests/ -q     # validation tests will catch broken rules
 ```
 
 If the app shows "Unknown auth provider" / "Unknown storage provider" on start, the `provider:` value doesn't match a registered name — the error message lists the available ones.
